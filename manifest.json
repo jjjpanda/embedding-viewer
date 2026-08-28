@@ -1,0 +1,10 @@
+{
+	"id": "embedding-viewer",
+	"name": "Embedding Viewer",
+	"version": "1.0.0",
+	"minAppVersion": "1.0.0",
+	"description": "View and manage embeddings in your Obsidian vault.",
+	"author": "jjjpanda",
+	"authorUrl": "https://github.com/jjjpanda",
+	"isDesktopOnly": true
+}

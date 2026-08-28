@@ -1,0 +1,195 @@
+import { App, PluginSettingTab, Setting } from 'obsidian';
+import EmbeddingViewerPlugin from './main';
+
+export interface EmbeddingViewerSettings {
+    embeddingEndpoint: string;
+    embeddingModel: string;
+    embeddingPrefix: string;
+    chunkSize: number;
+    penaltyPerMonth: number;
+    minimumSimilarity: number;
+    maximumSimilarity: number;
+    excludedFolders: string;
+    apiPort: number;
+    onLaunchCommand: string;
+    lastExcludedPhrases: string[];
+    graphLayers: number;
+}
+
+export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
+    embeddingEndpoint: 'http://127.0.0.1:8081',
+    embeddingModel: 'qwen3-embedding-0.6b',
+    embeddingPrefix: 'passage: ',
+    chunkSize: 250,
+    penaltyPerMonth: 0.25,
+    minimumSimilarity: 0.60,
+    maximumSimilarity: 0.95,
+    excludedFolders: '',
+    apiPort: 27123,
+    onLaunchCommand: '',
+    lastExcludedPhrases: [],
+    graphLayers: 5,
+};
+
+export class EmbeddingViewerSettingTab extends PluginSettingTab {
+    plugin: EmbeddingViewerPlugin;
+
+    constructor(app: App, plugin: EmbeddingViewerPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display(): void {
+        const { containerEl } = this;
+
+        containerEl.empty();
+
+        containerEl.createEl('h3', { text: 'Model Configuration' });
+
+        new Setting(containerEl)
+            .setName('Embedding Endpoint')
+            .setDesc('URL of the embedding API endpoint.')
+            .addText(text => text
+                .setPlaceholder('http://127.0.0.1:8081')
+                .setValue(this.plugin.settings.embeddingEndpoint)
+                .onChange(async (value) => {
+                    this.plugin.settings.embeddingEndpoint = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Embedding Model')
+            .setDesc('Name of the model to use for embeddings.')
+            .addText(text => text
+                .setPlaceholder('qwen3-embedding-0.6b')
+                .setValue(this.plugin.settings.embeddingModel)
+                .onChange(async (value) => {
+                    this.plugin.settings.embeddingModel = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Embedding Prefix')
+            .setDesc('Prefix to append to text chunks before embedding (e.g. "passage: " or "search_document: ").')
+            .addText(text => text
+                .setPlaceholder('passage: ')
+                .setValue(this.plugin.settings.embeddingPrefix)
+                .onChange(async (value) => {
+                    this.plugin.settings.embeddingPrefix = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        containerEl.createEl('h3', { text: 'Chunking & Searching' });
+
+        new Setting(containerEl)
+            .setName('Chunk Size')
+            .setDesc('Maximum number of characters per text chunk.')
+            .addText(text => text
+                .setPlaceholder('1500')
+                .setValue(this.plugin.settings.chunkSize.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value, 10);
+                    if (!isNaN(parsed)) {
+                        this.plugin.settings.chunkSize = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Recency Penalty (%)')
+            .setDesc('Percentage score penalty applied per month of note age (e.g., 1.0 for a 1% penalty per month).')
+            .addText(text => text
+                .setPlaceholder('1.0')
+                .setValue(this.plugin.settings.penaltyPerMonth.toString())
+                .onChange(async (value) => {
+                    const parsed = parseFloat(value);
+                    if (!isNaN(parsed)) {
+                        this.plugin.settings.penaltyPerMonth = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Minimum Similarity Threshold')
+            .setDesc('Hide results that fall below this similarity score (e.g. 0.70). Prevents garbage results.')
+            .addText(text => text
+                .setPlaceholder('0.70')
+                .setValue(this.plugin.settings.minimumSimilarity.toString())
+                .onChange(async (value) => {
+                    const parsed = parseFloat(value);
+                    if (!isNaN(parsed)) {
+                        this.plugin.settings.minimumSimilarity = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Maximum Similarity Threshold')
+            .setDesc('Hide results that are too similar (e.g., > 0.95) to filter out exact duplicate text and boilerplate.')
+            .addText(text => text
+                .setPlaceholder('0.95')
+                .setValue(this.plugin.settings.maximumSimilarity.toString())
+                .onChange(async (value) => {
+                    const parsed = parseFloat(value);
+                    if (!isNaN(parsed)) {
+                        this.plugin.settings.maximumSimilarity = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Graph Layers')
+            .setDesc('Number of recursive layers to fetch for the Similar Documents Graph.')
+            .addSlider(slider => slider
+                .setLimits(1, 8, 1)
+                .setValue(this.plugin.settings.graphLayers)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.graphLayers = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.app.workspace.getLeavesOfType('similar-notes-view').forEach(leaf => {
+                        if (leaf.view && (leaf.view as any).updateView) {
+                            (leaf.view as any).updateView();
+                        }
+                    });
+                }));
+
+        containerEl.createEl('h3', { text: 'Advanced' });
+
+        new Setting(containerEl)
+            .setName('Excluded Folders')
+            .setDesc('Folders to ignore during indexing. One per line (e.g. "templates/").')
+            .addTextArea(text => text
+                .setPlaceholder('templates/\njournal/')
+                .setValue(this.plugin.settings.excludedFolders)
+                .onChange(async (value) => {
+                    this.plugin.settings.excludedFolders = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('API Port')
+            .setDesc('Port number for the local HTTP API that agents can use to query the plugin. Restart plugin to apply.')
+            .addText(text => text
+                .setPlaceholder('27123')
+                .setValue(this.plugin.settings.apiPort.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value, 10);
+                    if (!isNaN(parsed) && parsed > 0 && parsed <= 65535) {
+                        this.plugin.settings.apiPort = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('On-Launch Command')
+            .setDesc('A terminal command to execute when the plugin loads (e.g., to start the local embedding server).')
+            .addText(text => text
+                .setPlaceholder('cd /path/to/server && ./server.sh')
+                .setValue(this.plugin.settings.onLaunchCommand)
+                .onChange(async (value) => {
+                    this.plugin.settings.onLaunchCommand = value;
+                    await this.plugin.saveSettings();
+                }));
+    }
+}

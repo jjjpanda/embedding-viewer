@@ -1,0 +1,575 @@
+import { App, TFile, Notice } from 'obsidian';
+import { DatabaseManager } from './db';
+import EmbeddingViewerPlugin from './main';
+
+export interface Chunk {
+    embedText: string;
+    content: string;
+    startLine: number;
+    endLine: number;
+    heading: string | null;
+}
+
+export class Indexer {
+    public isIndexing = false;
+    private schemaVerified = false;
+
+    constructor(
+        private app: App,
+        private dbManager: DatabaseManager,
+        private plugin: EmbeddingViewerPlugin
+    ) {}
+
+    private get model() { return this.plugin.settings.embeddingModel; }
+    private get endpoint() { return this.plugin.settings.embeddingEndpoint; }
+    private get prefix() { return this.plugin.settings.embeddingPrefix; }
+    private get maxChunkSize() { return this.plugin.settings.chunkSize; }
+
+    public stripWikilinks(text: string) {
+        return text.replace(/\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]/g, (_, target, alias) => {
+            if (alias && alias !== target) {
+                return `${alias} (${target})`;
+            }
+            return target;
+        });
+    }
+
+    private recursiveSplit(text: string, maxChunkSize: number): string[] {
+        if (text.length <= maxChunkSize) return [text];
+        
+        const separators = ['\n\n\n', '\n\n', '\n', '. ', ' '];
+        for (const sep of separators) {
+            if (text.includes(sep)) {
+                const parts = text.split(sep);
+                const chunks: string[] = [];
+                let currentChunk = '';
+                
+                for (const part of parts) {
+                    const proposed = currentChunk ? currentChunk + sep + part : part;
+                    if (proposed.length <= maxChunkSize) {
+                        currentChunk = proposed;
+                    } else {
+                        if (currentChunk) chunks.push(currentChunk);
+                        currentChunk = part;
+                    }
+                }
+                if (currentChunk) chunks.push(currentChunk);
+                
+                const finalChunks: string[] = [];
+                for (const c of chunks) {
+                    if (c.length > maxChunkSize && c !== text) {
+                        finalChunks.push(...this.recursiveSplit(c, maxChunkSize));
+                    } else {
+                        finalChunks.push(c);
+                    }
+                }
+                
+                if (finalChunks.length > 1 || (finalChunks.length === 1 && finalChunks[0] !== text)) {
+                    return finalChunks;
+                }
+            }
+        }
+        
+        const chunks = [];
+        for (let i = 0; i < text.length; i += maxChunkSize) {
+            chunks.push(text.slice(i, i + maxChunkSize));
+        }
+        return chunks;
+    }
+
+    private formatMetadataContext(file: TFile): string {
+        const cache = this.app.metadataCache.getFileCache(file);
+        if (!cache?.frontmatter) return '';
+        
+        const parts: string[] = [];
+        for (const [key, value] of Object.entries(cache.frontmatter)) {
+            if (key === 'position') continue;
+            
+            if (typeof value === 'string') {
+                parts.push(`${key.charAt(0).toUpperCase() + key.slice(1)}: ${value}`);
+            } else if (Array.isArray(value) && value.every(v => typeof v === 'string')) {
+                parts.push(`${key.charAt(0).toUpperCase() + key.slice(1)}: ${value.join(', ')}`);
+            }
+        }
+        
+        if (parts.length === 0) return '';
+        return 'Metadata: ' + parts.join('. ') + '.';
+    }
+
+    private async analyzeCommonPhrases(files: TFile[], progressCallback?: (msg: string | null) => void): Promise<string[]> {
+        if (files.length === 0) return [];
+        if (progressCallback) progressCallback('Analyzing common phrases...');
+        
+        const counts = new Map<string, number>();
+        
+        // Prevent OOM: sample up to 100 random files
+        const maxSamples = Math.min(files.length, 100);
+        const shuffled = [...files].sort(() => 0.5 - Math.random());
+        const sampleFiles = shuffled.slice(0, maxSamples);
+
+        for (const file of sampleFiles) {
+            let content = await this.app.vault.read(file);
+            content = this.stripWikilinks(content);
+            const lines = content.split(/\r?\n/).map(l => l.trim().toLowerCase()).filter(l => l.length > 0);
+            
+            const fileLines = new Set<string>(lines);
+            for (const line of fileLines) {
+                counts.set(line, (counts.get(line) || 0) + 1);
+            }
+        }
+        
+        // Phrases that appear in > 10% of sampled files or at least 5 files
+        const threshold = Math.max(5, Math.floor(sampleFiles.length * 0.10));
+        
+        const common: string[] = [];
+        for (const [phrase, count] of counts.entries()) {
+            if (count >= threshold) {
+                common.push(phrase);
+            }
+        }
+        
+        common.sort((a, b) => b.length - a.length);
+        return common;
+    }
+
+    private getFrontmatterLineCount(content: string): number {
+        const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+        return m ? m[0].split(/\r?\n/).length - 1 : 0;
+    }
+
+    private buildHeadingMap(lines: string[]): Record<number, { hierarchy: string, mostRecent: string | null }> {
+        const headingMap: Record<number, { hierarchy: string, mostRecent: string | null }> = {};
+        const headingStack: { level: number, text: string }[] = [];
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i] || '';
+            const match = line.match(/^(#{1,6})\s+(.+)$/);
+            if (match && match[1] && match[2]) {
+                const level = match[1].length;
+                const text = match[2];
+                while (headingStack.length > 0 && headingStack[headingStack.length - 1]!.level >= level) {
+                    headingStack.pop();
+                }
+                headingStack.push({ level, text });
+            }
+            headingMap[i] = {
+                hierarchy: headingStack.length > 0 ? 'Hierarchy: ' + headingStack.map(h => h.text).join(' > ') : '',
+                mostRecent: headingStack.length > 0 ? headingStack[headingStack.length - 1]!.text : null
+            };
+        }
+        return headingMap;
+    }
+
+    public extractChunks(content: string, file: TFile, excludedPhrases: string[] = []): Chunk[] {
+        const cache = this.app.metadataCache.getFileCache(file);
+        if (cache?.frontmatter?.['exclude_embedding'] === true) return [];
+
+        const chunks: Chunk[] = [];
+        const lines = content.split(/\r?\n/);
+        
+        const fmLineCount = this.getFrontmatterLineCount(content);
+        const headingMap = this.buildHeadingMap(lines);
+
+        // 3. Get the body text
+        const bodyText = lines.slice(fmLineCount).join('\n').trim();
+        if (!bodyText) return [];
+
+        // 4. Split body text handling code blocks separately
+        const pieces: string[] = [];
+        const codeBlockRegex = /(?:```|~~~)[\s\S]*?(?:```|~~~)/g;
+        let lastIndex = 0;
+        let matchCb;
+        while ((matchCb = codeBlockRegex.exec(bodyText)) !== null) {
+            const textBefore = bodyText.substring(lastIndex, matchCb.index).trim();
+            if (textBefore) {
+                pieces.push(...this.recursiveSplit(textBefore, this.maxChunkSize));
+            }
+            const codeBlockStr = matchCb[0];
+            if (codeBlockStr.length > this.maxChunkSize) {
+                // Split large code block by double newlines or single newlines
+                const delimiter = codeBlockStr.startsWith('~~~') ? '~~~' : '```';
+                const cbLines = codeBlockStr.split('\n');
+                let curCbChunk = cbLines[0] + '\n';
+                for (let i = 1; i < cbLines.length - 1; i++) {
+                    const lineStr = cbLines[i] + '\n';
+                    if ((curCbChunk.length + lineStr.length + delimiter.length) > this.maxChunkSize && curCbChunk.split('\n').length > 2) {
+                        curCbChunk += delimiter;
+                        pieces.push(curCbChunk);
+                        curCbChunk = delimiter + '\n' + lineStr;
+                    } else {
+                        curCbChunk += lineStr;
+                    }
+                }
+                curCbChunk += cbLines[cbLines.length - 1];
+                pieces.push(curCbChunk);
+            } else {
+                pieces.push(codeBlockStr);
+            }
+            lastIndex = codeBlockRegex.lastIndex;
+        }
+        const textAfter = bodyText.substring(lastIndex).trim();
+        if (textAfter) {
+            pieces.push(...this.recursiveSplit(textAfter, this.maxChunkSize));
+        }
+
+        // 5. Construct chunks, finding their line numbers
+        let currentSearchPos = 0;
+        const searchContent = content.replace(/\r\n/g, '\n');
+        const prefixStr = this.prefix ? this.prefix + '\n' : '';
+        
+        for (const piece of pieces) {
+            const trimmedPiece = piece.trim();
+            if (!trimmedPiece) continue;
+            
+            // Enforce minimum word count to drop semantic noise (unless code block)
+            const isCodeBlock = (trimmedPiece.startsWith('```') && trimmedPiece.endsWith('```')) || 
+                                (trimmedPiece.startsWith('~~~') && trimmedPiece.endsWith('~~~'));
+            if (!isCodeBlock) {
+                const wordCount = trimmedPiece.split(/\s+/).filter(w => w.length > 0).length;
+                if (wordCount < 8) continue;
+            }
+            
+            const chunkIndex = searchContent.indexOf(piece, currentSearchPos);
+            let startLine = 0;
+            if (chunkIndex !== -1) {
+                const textBefore = searchContent.substring(0, chunkIndex);
+                startLine = textBefore.split('\n').length - 1;
+                currentSearchPos = chunkIndex + piece.length;
+            } else {
+                startLine = fmLineCount;
+            }
+            
+            const headingInfo = headingMap[startLine] || { hierarchy: '', mostRecent: null };
+            
+            let finalPieceText = this.stripWikilinks(piece);
+            let filteredHierarchy = this.stripWikilinks(headingInfo.hierarchy);
+            
+            const excludeSet = new Set(excludedPhrases);
+            
+            if (!isCodeBlock) {
+                finalPieceText = finalPieceText.split(/\r?\n/)
+                    .filter(line => !excludeSet.has(line.trim().toLowerCase()))
+                    .join('\n');
+            }
+                
+            filteredHierarchy = filteredHierarchy.split(/\r?\n/)
+                .filter(line => !excludeSet.has(line.trim().toLowerCase()))
+                .join('\n');
+            
+            const embedText = (filteredHierarchy ? `${filteredHierarchy}\n\n` : '') + finalPieceText;
+            
+            chunks.push({
+                embedText,
+                content: finalPieceText.trim(),
+                startLine,
+                endLine: startLine + piece.split('\n').length - 1,
+                heading: headingInfo.mostRecent
+            });
+        }
+
+        return chunks;
+    }
+
+    public async embed(texts: string[], dimension?: number): Promise<number[][]> {
+        const res = await fetch(`${this.endpoint}/v1/embeddings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: this.model, input: texts, encoding_format: 'float' })
+        });
+        if (!res.ok) throw new Error(`Embedding API ${res.status}: ${await res.text()}`);
+        const { data } = await res.json();
+        return data.map((d: any) => d.embedding);
+    }
+
+    async rebuildIndex(progressCallback?: (msg: string | null) => void, force: boolean = false) {
+        if (this.isIndexing) return;
+        this.isIndexing = true;
+        try {
+            await this._rebuildIndex(progressCallback, force);
+        } finally {
+            this.isIndexing = false;
+        }
+    }
+
+    private async _rebuildIndex(progressCallback?: (msg: string | null) => void, force: boolean = false) {
+        const updateProgress = (msg: string | null) => {
+            if (progressCallback) progressCallback(msg);
+        };
+
+        const db = await this.dbManager.getDb();
+        if (!db) return;
+
+        try {
+            updateProgress('Starting index rebuild...');
+            new Notice('Starting index rebuild...');
+            
+            let dimension: number;
+            try {
+                const probeResult = await this.embed(['probe']);
+                dimension = probeResult[0]?.length || 0;
+            } catch (err) {
+                new Notice('Failed to connect to embedding server.');
+                console.error(err);
+                updateProgress('Failed to connect to embedding server.');
+                window.setTimeout(() => updateProgress(null), 3000);
+                return;
+            }
+
+            if (force) {
+                new Notice(`Force rebuilding index...`);
+                await db.query('TRUNCATE embeddings');
+            }
+
+            const { rows } = await db.query('SELECT model, dimension, metadata FROM embeddings LIMIT 1');
+            const sample = rows[0] as any;
+            if (sample) {
+                const meta = sample.metadata || {};
+                if (sample.model !== this.model || 
+                    sample.dimension !== dimension || 
+                    meta.chunkSize !== this.maxChunkSize || 
+                    meta.prefix !== this.prefix ||
+                    meta.excludedFolders !== this.plugin.settings.excludedFolders) {
+                    new Notice(`Settings changed. Full rebuild required.`);
+                    await db.query('TRUNCATE embeddings');
+                }
+            }
+
+            try {
+                await db.query(`DROP INDEX IF EXISTS embeddings_hnsw_idx`);
+                await db.query(`ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dimension})`);
+                this.schemaVerified = true;
+            } catch (e) {
+                console.log("Could not alter table dimension:", e);
+            }
+
+            const allFiles = this.app.vault.getMarkdownFiles();
+            const excluded = this.plugin.settings.excludedFolders
+                .split('\n')
+                .map(f => f.trim())
+                .filter(f => f.length > 0);
+
+            const files = allFiles.filter(f => {
+                for (const ex of excluded) {
+                    if (f.path.startsWith(ex)) return false;
+                }
+                return true;
+            });
+
+            const { rows: indexed } = await db.query('SELECT path, MAX(mtime) AS mtime FROM embeddings GROUP BY path');
+            const indexedMtimes = new Map(indexed.map((r: any) => [r.path, Number(r.mtime)]));
+
+            const currentPaths = new Set(files.map(f => f.path));
+            for (const [p] of indexedMtimes) {
+                if (!currentPaths.has(p)) {
+                    await db.query('DELETE FROM embeddings WHERE path = $1', [p]);
+                }
+            }
+
+            const toIndex = files.filter(f => {
+                const mtime = f.stat.mtime;
+                const stored = indexedMtimes.get(f.path);
+                return stored === undefined || mtime > stored;
+            });
+
+            if (toIndex.length === 0) {
+                new Notice('Index is up to date.');
+                updateProgress('Index is up to date.');
+                window.setTimeout(() => updateProgress(null), 3000);
+                return;
+            }
+
+            const dynamicExcludedPhrases = await this.analyzeCommonPhrases(files, updateProgress);
+            this.plugin.settings.lastExcludedPhrases = dynamicExcludedPhrases;
+            await this.plugin.saveSettings();
+
+            updateProgress(`Indexing 0/${toIndex.length} files...`);
+            new Notice(`Indexing ${toIndex.length} files...`);
+
+            let totalChunks = 0;
+            
+            let allChunks: { file: TFile, chunk: Chunk }[] = [];
+            for (let fi = 0; fi < toIndex.length; fi++) {
+                updateProgress(`Preparing ${fi + 1}/${toIndex.length} files...`);
+                const file = toIndex[fi] as TFile;
+                const content = await this.app.vault.read(file);
+                
+                await db.query('DELETE FROM embeddings WHERE path = $1', [file.path]);
+
+                const chunks = this.extractChunks(content, file, dynamicExcludedPhrases);
+                for (const chunk of chunks) {
+                    allChunks.push({ file, chunk });
+                }
+            }
+
+            const BATCH_SIZE = 10;
+            totalChunks = allChunks.length;
+            
+            let previousDbTask: Promise<void> | null = null;
+            
+            for (let i = 0; i < allChunks.length; i += BATCH_SIZE) {
+                updateProgress(`Embedding chunk ${i + 1}/${allChunks.length}...`);
+                const batch = allChunks.slice(i, i + BATCH_SIZE);
+                
+                const fetchPromise = this.embed(batch.map(item => {
+                    const text = `${this.prefix}${item.chunk.embedText}`;
+                    return text.length > 4000 ? text.substring(0, 4000) : text;
+                }), dimension);
+
+                const [embeddings] = await Promise.all([
+                    fetchPromise,
+                    previousDbTask || Promise.resolve()
+                ]);
+                
+                previousDbTask = (async () => {
+                    let queryValues = [];
+                    let queryParams = [];
+                    let paramIdx = 1;
+
+                    await db.exec('BEGIN');
+                    for (let j = 0; j < batch.length; j++) {
+                        const item = batch[j];
+                        const emb = embeddings[j];
+                        if (!item || !emb) continue;
+                        
+                        const meta = JSON.stringify({
+                            startLine: item.chunk.startLine, 
+                            endLine: item.chunk.endLine, 
+                            heading: item.chunk.heading,
+                            chunkSize: this.maxChunkSize,
+                            prefix: this.prefix,
+                            excludedFolders: this.plugin.settings.excludedFolders
+                        });
+
+                        queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
+                        queryParams.push(item.file.path, item.file.stat.mtime, item.chunk.content, this.model, dimension, `[${emb.join(',')}]`, meta);
+                    }
+
+                    if (queryValues.length > 0) {
+                        await db.query(
+                            `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
+                             VALUES ${queryValues.join(',')}`,
+                            queryParams
+                        );
+                    }
+                    await db.exec('COMMIT');
+                })();
+            }
+            if (previousDbTask) {
+                await previousDbTask;
+            }
+
+            updateProgress(`Finalizing index...`);
+            if (dimension <= 2000) {
+                await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
+            }
+            await this.dbManager.saveDb();
+            
+            new Notice(`Indexed ${totalChunks} chunks from ${toIndex.length} files.`);
+            updateProgress(`Indexed ${toIndex.length} files.`);
+            window.setTimeout(() => updateProgress(null), 3000);
+
+        } catch (err) {
+            console.error(err);
+            new Notice('Error during index rebuild. See console.');
+            updateProgress('Error during index rebuild.');
+            window.setTimeout(() => updateProgress(null), 3000);
+        }
+    }
+
+    private fileIndexQueue: TFile[] = [];
+    private isProcessingQueue = false;
+
+    async indexFile(file: TFile) {
+        if (this.isIndexing) return;
+        this.fileIndexQueue.push(file);
+        this.processQueue();
+    }
+
+    private async processQueue() {
+        if (this.isProcessingQueue) return;
+        this.isProcessingQueue = true;
+
+        while (this.fileIndexQueue.length > 0) {
+            const file = this.fileIndexQueue.shift();
+            if (!file) continue;
+
+            const db = await this.dbManager.getDb();
+            if (!db) continue;
+
+            try {
+            const probeResult = await this.embed(['probe']);
+            const dimension = probeResult[0]?.length || 0;
+
+            if (dimension > 0 && !this.schemaVerified) {
+                try {
+                    await db.query(`DROP INDEX IF EXISTS embeddings_hnsw_idx`);
+                    await db.query(`ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dimension})`);
+                    if (dimension <= 2000) {
+                        await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
+                    }
+                    this.schemaVerified = true;
+                } catch (e) {
+                    console.log("Could not alter table/create index in indexFile:", e);
+                }
+            }
+
+            const content = await this.app.vault.read(file);
+            await db.query('DELETE FROM embeddings WHERE path = $1', [file.path]);
+
+            const chunks = this.extractChunks(content, file, this.plugin.settings.lastExcludedPhrases);
+            if (chunks.length === 0) return;
+
+            const BATCH_SIZE = 20;
+            for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+                const batch = chunks.slice(i, i + BATCH_SIZE);
+                const embeddings = await this.embed(batch.map(p => {
+                    const text = `${this.prefix}${p.embedText}`;
+                    return text.length > 4000 ? text.substring(0, 4000) : text;
+                }), dimension);
+                
+                let queryValues = [];
+                let queryParams = [];
+                let paramIdx = 1;
+                
+                await db.exec('BEGIN');
+                for (let j = 0; j < batch.length; j++) {
+                    const p = batch[j] as Chunk;
+                    const emb = embeddings[j];
+                    if (!emb) continue;
+                    
+                    const meta = JSON.stringify({
+                        startLine: p.startLine, 
+                        endLine: p.endLine, 
+                        heading: p.heading,
+                        chunkSize: this.maxChunkSize,
+                        prefix: this.prefix,
+                        excludedFolders: this.plugin.settings.excludedFolders
+                    });
+
+                    queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
+                    queryParams.push(file.path, file.stat.mtime, p.content, this.model, dimension, `[${emb.join(',')}]`, meta);
+                }
+
+                if (queryValues.length > 0) {
+                    await db.query(
+                        `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
+                         VALUES ${queryValues.join(',')}`,
+                        queryParams
+                    );
+                }
+                await db.exec('COMMIT');
+            }
+        } catch (err) {
+            console.error(`Error indexing file ${file.path}:`, err);
+        }
+        } // End of while loop
+        this.isProcessingQueue = false;
+    }
+
+    async deleteFile(path: string) {
+        if (this.isIndexing) return;
+        const db = await this.dbManager.getDb();
+        if (!db) return;
+        await db.query('DELETE FROM embeddings WHERE path = $1', [path]);
+    }
+}

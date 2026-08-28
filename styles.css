@@ -1,0 +1,34 @@
+.embedding-similar-notes {
+    margin-top: 2rem;
+    padding: 1rem;
+    border-top: 1px solid var(--background-modifier-border);
+    background-color: var(--background-secondary);
+    border-radius: 4px;
+}
+
+.embedding-similar-notes h3 {
+    margin-top: 0;
+    margin-bottom: 0.5rem;
+    font-size: 1.1em;
+    color: var(--text-muted);
+}
+
+.embedding-similar-notes ul {
+    margin: 0;
+    padding-left: 1.5rem;
+}
+
+.embedding-similar-notes .similarity-score {
+    color: var(--text-faint);
+    font-size: 0.9em;
+}
+
+.embedding-chunk-highlight-1 {
+    background-color: rgba(100, 149, 237, 0.15); /* Cornflower blue */
+    border-left: 3px solid rgba(100, 149, 237, 0.4);
+}
+
+.embedding-chunk-highlight-2 {
+    background-color: rgba(237, 100, 100, 0.15); /* Light red */
+    border-left: 3px solid rgba(237, 100, 100, 0.4);
+}
