@@ -18,6 +18,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
     api!: LocalApi;
     visualizerActive: boolean = false;
     onLaunchProcess: ChildProcess | null = null;
+    statusBarItem!: HTMLElement;
 
     async onload() {
         await this.loadSettings();
@@ -68,7 +69,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             indexDebouncers.set(file.path, setTimeout(() => {
                 indexDebouncers.delete(file.path);
                 this.indexer.indexFile(file);
-            }, 5000));
+            }, this.settings.debounceTime || 15000));
         };
         
         this.registerEvent(this.app.vault.on('modify', (file) => scheduleIndex(file)));
@@ -114,8 +115,8 @@ export default class EmbeddingViewerPlugin extends Plugin {
         // This adds a settings tab so the user can configure various aspects of the plugin
         this.addSettingTab(new EmbeddingViewerSettingTab(this.app, this));
 
-        const statusBarItem = this.addStatusBarItem();
-        statusBarItem.setText('');
+        this.statusBarItem = this.addStatusBarItem();
+        this.statusBarItem.setText('');
 
         this.addCommand({
             id: 'toggle-chunk-visualizer',
@@ -144,9 +145,9 @@ export default class EmbeddingViewerPlugin extends Plugin {
             callback: async () => {
                 await this.indexer.rebuildIndex((msg) => {
                     if (msg === null) {
-                        statusBarItem.setText('');
+                        this.statusBarItem.setText('');
                     } else {
-                        statusBarItem.setText(`🧠 ${msg}`);
+                        this.statusBarItem.setText(`🧠 ${msg}`);
                     }
                 });
             },
@@ -158,9 +159,9 @@ export default class EmbeddingViewerPlugin extends Plugin {
             callback: async () => {
                 await this.indexer.rebuildIndex((msg) => {
                     if (msg === null) {
-                        statusBarItem.setText('');
+                        this.statusBarItem.setText('');
                     } else {
-                        statusBarItem.setText(`🧠 ${msg}`);
+                        this.statusBarItem.setText(`🧠 ${msg}`);
                     }
                 }, true);
             },

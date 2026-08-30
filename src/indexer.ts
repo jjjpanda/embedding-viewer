@@ -34,6 +34,16 @@ export class Indexer {
         });
     }
 
+    private hashString(str: string): string {
+        let hash = 0;
+        for (let i = 0, len = str.length; i < len; i++) {
+            let chr = str.charCodeAt(i);
+            hash = (hash << 5) - hash + chr;
+            hash |= 0;
+        }
+        return hash.toString();
+    }
+
     private recursiveSplit(text: string, maxChunkSize: number): string[] {
         if (text.length <= maxChunkSize) return [text];
         
@@ -387,17 +397,18 @@ export class Indexer {
 
             let totalChunks = 0;
             
-            let allChunks: { file: TFile, chunk: Chunk }[] = [];
+            let allChunks: { file: TFile, chunk: Chunk, contentHash: string }[] = [];
             for (let fi = 0; fi < toIndex.length; fi++) {
                 updateProgress(`Preparing ${fi + 1}/${toIndex.length} files...`);
                 const file = toIndex[fi] as TFile;
                 const content = await this.app.vault.read(file);
+                const contentHash = this.hashString(content);
                 
                 await db.query('DELETE FROM embeddings WHERE path = $1', [file.path]);
 
                 const chunks = this.extractChunks(content, file, dynamicExcludedPhrases);
                 for (const chunk of chunks) {
-                    allChunks.push({ file, chunk });
+                    allChunks.push({ file, chunk, contentHash });
                 }
             }
 
@@ -437,7 +448,8 @@ export class Indexer {
                             heading: item.chunk.heading,
                             chunkSize: this.maxChunkSize,
                             prefix: this.prefix,
-                            excludedFolders: this.plugin.settings.excludedFolders
+                            excludedFolders: this.plugin.settings.excludedFolders,
+                            fileHash: item.contentHash
                         });
 
                         queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
@@ -481,7 +493,9 @@ export class Indexer {
 
     async indexFile(file: TFile) {
         if (this.isIndexing) return;
-        this.fileIndexQueue.push(file);
+        if (!this.fileIndexQueue.some(f => f.path === file.path)) {
+            this.fileIndexQueue.push(file);
+        }
         this.processQueue();
     }
 
@@ -492,6 +506,10 @@ export class Indexer {
         while (this.fileIndexQueue.length > 0) {
             const file = this.fileIndexQueue.shift();
             if (!file) continue;
+            
+            if (this.plugin.statusBarItem) {
+                this.plugin.statusBarItem.setText(`🧠 Indexing ${file.basename}...`);
+            }
 
             const db = await this.dbManager.getDb();
             if (!db) continue;
@@ -514,10 +532,20 @@ export class Indexer {
             }
 
             const content = await this.app.vault.read(file);
+            const contentHash = this.hashString(content);
+
+            const { rows } = await db.query('SELECT metadata FROM embeddings WHERE path = $1 LIMIT 1', [file.path]);
+            if (rows.length > 0) {
+                const existingMeta = (rows[0] as any).metadata;
+                if (existingMeta && existingMeta.fileHash === contentHash && existingMeta.chunkSize === this.maxChunkSize && existingMeta.prefix === this.prefix) {
+                    continue;
+                }
+            }
+
             await db.query('DELETE FROM embeddings WHERE path = $1', [file.path]);
 
             const chunks = this.extractChunks(content, file, this.plugin.settings.lastExcludedPhrases);
-            if (chunks.length === 0) return;
+            if (chunks.length === 0) continue;
 
             const BATCH_SIZE = 20;
             for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
@@ -543,7 +571,8 @@ export class Indexer {
                         heading: p.heading,
                         chunkSize: this.maxChunkSize,
                         prefix: this.prefix,
-                        excludedFolders: this.plugin.settings.excludedFolders
+                        excludedFolders: this.plugin.settings.excludedFolders,
+                        fileHash: contentHash
                     });
 
                     queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
@@ -564,6 +593,10 @@ export class Indexer {
         }
         } // End of while loop
         this.isProcessingQueue = false;
+        
+        if (this.plugin.statusBarItem) {
+            this.plugin.statusBarItem.setText('');
+        }
     }
 
     async deleteFile(path: string) {

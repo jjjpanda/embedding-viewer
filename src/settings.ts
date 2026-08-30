@@ -6,6 +6,7 @@ export interface EmbeddingViewerSettings {
     embeddingModel: string;
     embeddingPrefix: string;
     chunkSize: number;
+    debounceTime: number;
     penaltyPerMonth: number;
     minimumSimilarity: number;
     maximumSimilarity: number;
@@ -21,6 +22,7 @@ export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
     embeddingModel: 'qwen3-embedding-0.6b',
     embeddingPrefix: 'passage: ',
     chunkSize: 250,
+    debounceTime: 15000,
     penaltyPerMonth: 0.25,
     minimumSimilarity: 0.60,
     maximumSimilarity: 0.95,
@@ -91,6 +93,20 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     const parsed = parseInt(value, 10);
                     if (!isNaN(parsed)) {
                         this.plugin.settings.chunkSize = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Indexing Debounce Time (ms)')
+            .setDesc('Milliseconds to wait after you stop typing before indexing a file. Increase this if indexing feels laggy while you edit (default 15000).')
+            .addText(text => text
+                .setPlaceholder('15000')
+                .setValue(this.plugin.settings.debounceTime.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value, 10);
+                    if (!isNaN(parsed)) {
+                        this.plugin.settings.debounceTime = parsed;
                         await this.plugin.saveSettings();
                     }
                 }));
