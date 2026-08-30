@@ -43,6 +43,25 @@ export class DatabaseManager {
                 metadata JSONB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS embeddings_path_idx ON embeddings USING btree (path);
+            
+            CREATE TABLE IF NOT EXISTS file_registry (
+                path TEXT PRIMARY KEY,
+                mtime BIGINT NOT NULL,
+                hash TEXT NOT NULL,
+                chunk_size INT NOT NULL,
+                prefix TEXT NOT NULL
+            );
+
+            INSERT INTO file_registry (path, mtime, hash, chunk_size, prefix)
+            SELECT DISTINCT ON (path) 
+                path, 
+                mtime, 
+                metadata->>'fileHash', 
+                (metadata->>'chunkSize')::int, 
+                metadata->>'prefix'
+            FROM embeddings
+            WHERE metadata->>'fileHash' IS NOT NULL
+            ON CONFLICT (path) DO NOTHING;
         `);
 
         try {

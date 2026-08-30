@@ -23,7 +23,7 @@ export class Indexer {
     private get model() { return this.plugin.settings.embeddingModel; }
     private get endpoint() { return this.plugin.settings.embeddingEndpoint; }
     private get prefix() { return this.plugin.settings.embeddingPrefix; }
-    private get maxChunkSize() { return this.plugin.settings.chunkSize; }
+    private get maxChunkSize() { return Number(this.plugin.settings.chunkSize) || 250; }
 
     public stripWikilinks(text: string) {
         return text.replace(/\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]/g, (_, target, alias) => {
@@ -328,6 +328,7 @@ export class Indexer {
             if (force) {
                 new Notice(`Force rebuilding index...`);
                 await db.query('TRUNCATE embeddings');
+                await db.query('TRUNCATE file_registry');
             }
 
             const { rows } = await db.query('SELECT model, dimension, metadata FROM embeddings LIMIT 1');
@@ -341,6 +342,7 @@ export class Indexer {
                     meta.excludedFolders !== this.plugin.settings.excludedFolders) {
                     new Notice(`Settings changed. Full rebuild required.`);
                     await db.query('TRUNCATE embeddings');
+                    await db.query('TRUNCATE file_registry');
                 }
             }
 
@@ -365,20 +367,28 @@ export class Indexer {
                 return true;
             });
 
-            const { rows: indexed } = await db.query('SELECT path, MAX(mtime) AS mtime FROM embeddings GROUP BY path');
+            const { rows: indexed } = await db.query('SELECT path, mtime FROM file_registry');
             const indexedMtimes = new Map(indexed.map((r: any) => [r.path, Number(r.mtime)]));
 
             const currentPaths = new Set(files.map(f => f.path));
             for (const [p] of indexedMtimes) {
                 if (!currentPaths.has(p)) {
                     await db.query('DELETE FROM embeddings WHERE path = $1', [p]);
+                    await db.query('DELETE FROM file_registry WHERE path = $1', [p]);
                 }
             }
 
+            console.log(`[Embedding Viewer] Manual Rebuild Index triggered.`);
+            
             const toIndex = files.filter(f => {
-                const mtime = f.stat.mtime;
-                const stored = indexedMtimes.get(f.path);
-                return stored === undefined || mtime > stored;
+                const mtime = Math.floor(f.stat.mtime);
+                const storedRaw = indexedMtimes.get(f.path);
+                const stored = storedRaw === undefined ? undefined : Math.floor(storedRaw);
+                const outOfDate = stored === undefined || mtime > stored;
+                if (outOfDate) {
+                    console.log(`[Embedding Viewer] Rebuild found stale file: ${f.path} (File mtime: ${mtime} > DB stored: ${stored})`);
+                }
+                return outOfDate;
             });
 
             if (toIndex.length === 0) {
@@ -406,7 +416,17 @@ export class Indexer {
                 
                 await db.query('DELETE FROM embeddings WHERE path = $1', [file.path]);
 
+                console.log(`[Embedding Viewer] Manual index extracting chunks for: ${file.path}`);
                 const chunks = this.extractChunks(content, file, dynamicExcludedPhrases);
+                
+                await db.query(
+                    `INSERT INTO file_registry (path, mtime, hash, chunk_size, prefix) 
+                     VALUES ($1, $2, $3, $4, $5) 
+                     ON CONFLICT (path) DO UPDATE SET 
+                     mtime = EXCLUDED.mtime, hash = EXCLUDED.hash, chunk_size = EXCLUDED.chunk_size, prefix = EXCLUDED.prefix`,
+                    [file.path, Math.floor(file.stat.mtime), contentHash, this.maxChunkSize, this.prefix]
+                );
+
                 for (const chunk of chunks) {
                     allChunks.push({ file, chunk, contentHash });
                 }
@@ -453,7 +473,7 @@ export class Indexer {
                         });
 
                         queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
-                        queryParams.push(item.file.path, item.file.stat.mtime, item.chunk.content, this.model, dimension, `[${emb.join(',')}]`, meta);
+                        queryParams.push(item.file.path, Math.floor(item.file.stat.mtime), item.chunk.content, this.model, dimension, `[${emb.join(',')}]`, meta);
                     }
 
                     if (queryValues.length > 0) {
@@ -503,21 +523,16 @@ export class Indexer {
         if (this.isProcessingQueue) return;
         this.isProcessingQueue = true;
 
-        while (this.fileIndexQueue.length > 0) {
-            const file = this.fileIndexQueue.shift();
-            if (!file) continue;
-            
-            if (this.plugin.statusBarItem) {
-                this.plugin.statusBarItem.setText(`🧠 Indexing ${file.basename}...`);
-            }
+        const db = await this.dbManager.getDb();
+        if (!db) {
+            this.isProcessingQueue = false;
+            return;
+        }
 
-            const db = await this.dbManager.getDb();
-            if (!db) continue;
-
-            try {
+        let dimension = 0;
+        try {
             const probeResult = await this.embed(['probe']);
-            const dimension = probeResult[0]?.length || 0;
-
+            dimension = probeResult[0]?.length || 0;
             if (dimension > 0 && !this.schemaVerified) {
                 try {
                     await db.query(`DROP INDEX IF EXISTS embeddings_hnsw_idx`);
@@ -527,24 +542,57 @@ export class Indexer {
                     }
                     this.schemaVerified = true;
                 } catch (e) {
-                    console.log("Could not alter table/create index in indexFile:", e);
+                    console.log("Could not alter table/create index in processQueue:", e);
                 }
             }
+        } catch (e) {
+            console.error("Probe failed in processQueue:", e);
+        }
+
+        while (this.fileIndexQueue.length > 0) {
+            const file = this.fileIndexQueue.shift();
+            if (!file) continue;
+
+            console.log(`[Embedding Viewer] processQueue dequeued file: ${file.path}`);
+
+            try {
 
             const content = await this.app.vault.read(file);
             const contentHash = this.hashString(content);
 
-            const { rows } = await db.query('SELECT metadata FROM embeddings WHERE path = $1 LIMIT 1', [file.path]);
+            const { rows } = await db.query('SELECT mtime, hash, chunk_size, prefix FROM file_registry WHERE path = $1 LIMIT 1', [file.path]);
             if (rows.length > 0) {
-                const existingMeta = (rows[0] as any).metadata;
-                if (existingMeta && existingMeta.fileHash === contentHash && existingMeta.chunkSize === this.maxChunkSize && existingMeta.prefix === this.prefix) {
+                const reg = rows[0] as any;
+                if (reg.hash === contentHash && reg.chunk_size === this.maxChunkSize && reg.prefix === this.prefix) {
+                    console.log(`[Embedding Viewer] Cache hit for ${file.path} (hash: ${contentHash}). Skipping full index.`);
+                    if (Math.floor(Number(reg.mtime)) !== Math.floor(file.stat.mtime)) {
+                        console.log(`[Embedding Viewer] Cache mtime drift detected for ${file.path} (DB: ${reg.mtime} vs File: ${file.stat.mtime}). Updating mtime.`);
+                        await db.query('UPDATE file_registry SET mtime = $1 WHERE path = $2', [Math.floor(file.stat.mtime), file.path]);
+                    }
                     continue;
                 }
+                console.log(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Hash changed (${reg.hash} -> ${contentHash}) or settings changed.`);
+            } else {
+                console.log(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Not in registry.`);
+            }
+
+            if (this.plugin.statusBarItem) {
+                this.plugin.statusBarItem.setText(`🧠 Indexing ${file.basename}...`);
             }
 
             await db.query('DELETE FROM embeddings WHERE path = $1', [file.path]);
 
             const chunks = this.extractChunks(content, file, this.plugin.settings.lastExcludedPhrases);
+            
+            // Insert into file_registry regardless of chunks length
+            await db.query(
+                `INSERT INTO file_registry (path, mtime, hash, chunk_size, prefix) 
+                 VALUES ($1, $2, $3, $4, $5) 
+                 ON CONFLICT (path) DO UPDATE SET 
+                 mtime = EXCLUDED.mtime, hash = EXCLUDED.hash, chunk_size = EXCLUDED.chunk_size, prefix = EXCLUDED.prefix`,
+                [file.path, Math.floor(file.stat.mtime), contentHash, this.maxChunkSize, this.prefix]
+            );
+
             if (chunks.length === 0) continue;
 
             const BATCH_SIZE = 20;
@@ -576,7 +624,7 @@ export class Indexer {
                     });
 
                     queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
-                    queryParams.push(file.path, file.stat.mtime, p.content, this.model, dimension, `[${emb.join(',')}]`, meta);
+                    queryParams.push(file.path, Math.floor(file.stat.mtime), p.content, this.model, dimension, `[${emb.join(',')}]`, meta);
                 }
 
                 if (queryValues.length > 0) {
@@ -604,5 +652,6 @@ export class Indexer {
         const db = await this.dbManager.getDb();
         if (!db) return;
         await db.query('DELETE FROM embeddings WHERE path = $1', [path]);
+        await db.query('DELETE FROM file_registry WHERE path = $1', [path]);
     }
 }

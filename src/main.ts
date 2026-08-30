@@ -61,22 +61,30 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
         const indexDebouncers = new Map<string, any>();
         
-        const scheduleIndex = (file: any) => {
+        const scheduleIndex = (file: any, eventName: string) => {
             if (file.extension !== 'md') return;
             if (indexDebouncers.has(file.path)) {
                 clearTimeout(indexDebouncers.get(file.path)!);
             }
             indexDebouncers.set(file.path, setTimeout(() => {
                 indexDebouncers.delete(file.path);
+                console.log(`[Embedding Viewer] Queueing file for indexing (Event-driven: ${eventName}):`, file.path);
                 this.indexer.indexFile(file);
             }, this.settings.debounceTime || 15000));
         };
         
-        this.registerEvent(this.app.vault.on('modify', (file) => scheduleIndex(file)));
-        this.registerEvent(this.app.vault.on('create', (file) => scheduleIndex(file)));
+        this.registerEvent(this.app.vault.on('modify', (file) => {
+            console.log(`[Embedding Viewer] File modified event:`, file.path);
+            scheduleIndex(file, 'modify');
+        }));
+        this.registerEvent(this.app.vault.on('create', (file) => {
+            console.log(`[Embedding Viewer] File created event:`, file.path);
+            scheduleIndex(file, 'create');
+        }));
         
         this.registerEvent(this.app.vault.on('delete', (file) => {
             if (file.path && file.path.endsWith('.md')) {
+                console.log(`[Embedding Viewer] File deleted event:`, file.path);
                 if (indexDebouncers.has(file.path)) {
                     clearTimeout(indexDebouncers.get(file.path)!);
                     indexDebouncers.delete(file.path);
@@ -87,8 +95,9 @@ export default class EmbeddingViewerPlugin extends Plugin {
         
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
             if (file.path && file.path.endsWith('.md')) {
+                console.log(`[Embedding Viewer] File renamed event: ${oldPath} -> ${file.path}`);
                 this.indexer.deleteFile(oldPath);
-                scheduleIndex(file);
+                scheduleIndex(file, 'rename');
             }
         }));
 
