@@ -513,6 +513,19 @@ export class Indexer {
 
     async indexFile(file: TFile) {
         if (this.isIndexing) return;
+
+        const excluded = this.plugin.settings.excludedFolders
+            .split('\n')
+            .map(f => f.trim())
+            .filter(f => f.length > 0);
+
+        for (const ex of excluded) {
+            if (file.path.startsWith(ex)) {
+                this.deleteFile(file.path);
+                return;
+            }
+        }
+
         if (!this.fileIndexQueue.some(f => f.path === file.path)) {
             this.fileIndexQueue.push(file);
         }
