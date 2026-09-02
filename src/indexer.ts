@@ -487,24 +487,26 @@ export class Indexer {
             totalChunks = allChunks.length;
             
             let previousDbTask: Promise<void> | null = null;
-            
+
+            // Pipeline: overlap fetch[N] with dbInsert[N-1].
+            // Late iterations stall here because IDB commits slow as the table grows.
             for (let i = 0; i < allChunks.length; i += BATCH_SIZE) {
                 updateProgress(`Embedding chunk ${i + 1}/${allChunks.length}...`);
                 const batch = allChunks.slice(i, i + BATCH_SIZE);
-                
+
                 const fetchPromise = this.embed(batch.map(item => {
                     const text = `${this.prefix}${item.chunk.embedText}`;
                     return text.length > 4000 ? text.substring(0, 4000) : text;
                 }), dimension);
 
+                // Bottleneck shifts from fetch to previousDbTask as table grows
                 const [embeddings] = await Promise.all([
                     fetchPromise,
                     previousDbTask || Promise.resolve()
                 ]);
 
-                // Yield to ensure progress bar updates if fetch is very fast
                 await new Promise(r => window.setTimeout(r, 10));
-                
+
                 previousDbTask = (async () => {
                     let queryValues = [];
                     let queryParams = [];
@@ -541,10 +543,13 @@ export class Indexer {
                 })();
             }
             if (previousDbTask) {
+                // Final DB write — no fetch to overlap with, so this blocks visibly
+                updateProgress(`Writing final embeddings...`);
                 await previousDbTask;
             }
 
             updateProgress(`Finalizing index...`);
+            // HNSW build is O(n log n) in WASM — can take minutes for large vaults
             if (dimension <= 2000) {
                 await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
             } else if (dimension <= 4000) {
@@ -672,14 +677,15 @@ export class Indexer {
 
             const BATCH_SIZE = this.plugin.settings.batchSize ?? 50;
             let previousDbTask: Promise<void> | null = null;
-            
+
+            // Same pipeline as rebuildIndex — overlap fetch[N] with dbInsert[N-1]
             for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
                 const batch = chunks.slice(i, i + BATCH_SIZE);
                 const fetchPromise = this.embed(batch.map(p => {
                     const text = `${this.prefix}${p.embedText}`;
                     return text.length > 4000 ? text.substring(0, 4000) : text;
                 }), dimension);
-                
+
                 const [embeddings] = await Promise.all([
                     fetchPromise,
                     previousDbTask || Promise.resolve()

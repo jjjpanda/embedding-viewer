@@ -105,7 +105,7 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.batchSize.toString())
                 .onChange(async (value) => {
                     const parsed = parseInt(value, 10);
-                    if (!isNaN(parsed)) {
+                    if (!isNaN(parsed) && parsed > 0) {
                         this.plugin.settings.batchSize = parsed;
                         await this.plugin.saveSettings();
                     }

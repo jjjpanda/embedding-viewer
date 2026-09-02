@@ -105,13 +105,25 @@ export class QueryService {
 
             const vectorStr = `[${vector.join(',')}]`;
             const maxSim = this.plugin.settings.maximumSimilarity ?? 0.95;
+            const dim = vector.length;
+            const useHalfvec = dim > 2000 && dim <= 4000;
 
-            let queryStr = `
-                SELECT path, content, metadata->>'heading' AS heading, (metadata->>'startLine')::int AS "startLine", (metadata->>'endLine')::int AS "endLine", mtime,
-                (1 - (embedding <=> $1::vector)) as "rawSimilarity"
-                FROM embeddings
-                ORDER BY embedding <=> $1::vector LIMIT 300
-            `;
+            let queryStr: string;
+            if (useHalfvec) {
+                queryStr = `
+                    SELECT path, content, metadata->>'heading' AS heading, (metadata->>'startLine')::int AS "startLine", (metadata->>'endLine')::int AS "endLine", mtime,
+                    (1 - (embedding::halfvec(${dim}) <=> $1::halfvec(${dim}))) as "rawSimilarity"
+                    FROM embeddings
+                    ORDER BY embedding::halfvec(${dim}) <=> $1::halfvec(${dim}) LIMIT 300
+                `;
+            } else {
+                queryStr = `
+                    SELECT path, content, metadata->>'heading' AS heading, (metadata->>'startLine')::int AS "startLine", (metadata->>'endLine')::int AS "endLine", mtime,
+                    (1 - (embedding <=> $1::vector)) as "rawSimilarity"
+                    FROM embeddings
+                    ORDER BY embedding <=> $1::vector LIMIT 300
+                `;
+            }
             const params: any[] = [vectorStr];
 
             const { rows } = await db.query(queryStr, params);
