@@ -39,10 +39,10 @@ export class SimilarNotesView extends ItemView {
         this.registerEvent(
             this.app.workspace.on('file-open', (file) => {
                 if (debounceTimer) {
-                    clearTimeout(debounceTimer);
+                    window.clearTimeout(debounceTimer);
                 }
                 
-                debounceTimer = setTimeout(() => {
+                debounceTimer = window.setTimeout(() => {
                     if (file && file.extension === 'md') {
                         if (file.path !== this.activeFile) {
                             this.activeFile = file.path;
@@ -103,23 +103,23 @@ export class SimilarNotesView extends ItemView {
             container.createEl('h3', { text: 'Similar Snippets' });
             
             const activeBasename = this.activeFile.split('/').pop()?.replace(/\.md$/, '') || this.activeFile;
-            const subtitle = container.createEl('div', { text: activeBasename });
+            const subtitle = container.createDiv({ text: activeBasename });
             subtitle.style.fontSize = '0.9em';
             subtitle.style.color = 'var(--text-muted)';
             subtitle.style.marginBottom = '16px';
             
             for (const group of chunkGroups) {
-                const groupDiv = container.createEl('div');
+                const groupDiv = container.createDiv();
                 groupDiv.style.marginBottom = '12px';
                 groupDiv.style.fontSize = '0.9em';
                 
-                const rationaleLabel = groupDiv.createEl('div');
+                const rationaleLabel = groupDiv.createDiv();
                 rationaleLabel.style.fontSize = '0.85em';
                 rationaleLabel.style.color = 'var(--text-muted)';
                 rationaleLabel.style.marginBottom = '2px';
                 rationaleLabel.textContent = 'Matches your snippet:';
                 
-                const sourceDiv = groupDiv.createEl('div');
+                const sourceDiv = groupDiv.createDiv();
                 sourceDiv.style.borderLeft = '2px solid var(--interactive-accent)';
                 sourceDiv.style.paddingLeft = '8px';
                 sourceDiv.style.color = 'var(--text-faint)';
@@ -136,7 +136,7 @@ export class SimilarNotesView extends ItemView {
                 sourceDiv.textContent = `"${sourceText}"`;
                 
                 for (const res of group.matches) {
-                    const matchDiv = groupDiv.createEl('div');
+                    const matchDiv = groupDiv.createDiv();
                     matchDiv.style.paddingLeft = '12px';
                     matchDiv.style.whiteSpace = 'nowrap';
                     matchDiv.style.overflow = 'hidden';

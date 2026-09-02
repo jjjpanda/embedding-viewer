@@ -46,7 +46,7 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
 
         containerEl.empty();
 
-        containerEl.createEl('h3', { text: 'Model Configuration' });
+        new Setting(containerEl).setName("Model Configuration").setHeading();
 
         new Setting(containerEl)
             .setName('Embedding Endpoint')
@@ -81,7 +81,7 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        containerEl.createEl('h3', { text: 'Chunking & Searching' });
+        new Setting(containerEl).setName("Chunking & Searching").setHeading();
 
         new Setting(containerEl)
             .setName('Chunk Size')
@@ -167,7 +167,7 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     }
                 }));
 
-        containerEl.createEl('h3', { text: 'Advanced' });
+        new Setting(containerEl).setName("Advanced").setHeading();
 
         new Setting(containerEl)
             .setName('Excluded Folders')

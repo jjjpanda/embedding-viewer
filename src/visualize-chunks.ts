@@ -184,7 +184,11 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                 const text = chunk.content.trim();
                 if (!text) return;
 
-                this.timer = window.setTimeout(() => { this.triggerHover(chunk, text, file, e.clientX, e.clientY); }, 800);
+                this.timer = window.setTimeout(() => { 
+                    this.triggerHover(chunk, text, file, e.clientX, e.clientY).catch(err => {
+                        console.error('Hover trigger failed:', err);
+                    }); 
+                }, 800);
             }
 
             async triggerHover(_chunk: Chunk, text: string, file: TFile, x: number, y: number) {

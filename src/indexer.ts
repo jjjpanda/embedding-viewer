@@ -126,7 +126,7 @@ export class Indexer {
             for (const line of fileLines) {
                 counts.set(line, (counts.get(line) || 0) + 1);
             }
-            await new Promise(resolve => setTimeout(resolve, 0)); // yield to UI
+            await new Promise(resolve => window.setTimeout(resolve, 0)); // yield to UI
         }
         
         // Phrases that appear in > 10% of sampled files or at least 5 files
@@ -283,7 +283,7 @@ export class Indexer {
 
     public async embed(texts: string[], dimension?: number): Promise<number[][]> {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 seconds timeout
+        const timeoutId = window.setTimeout(() => controller.abort(), 30000); // 30 seconds timeout
         try {
             const res = await fetch(`${this.endpoint}/v1/embeddings`, {
                 method: 'POST',
@@ -295,7 +295,7 @@ export class Indexer {
             const { data } = await res.json();
             return data.map((d: any) => d.embedding);
         } finally {
-            clearTimeout(timeoutId);
+            window.clearTimeout(timeoutId);
         }
     }
 
@@ -427,7 +427,7 @@ export class Indexer {
             for (let fi = 0; fi < toIndex.length; fi++) {
                 if (fi % 10 === 0) {
                     updateProgress(`Preparing ${fi + 1}/${toIndex.length} files...`);
-                    await new Promise(r => setTimeout(r, 0)); // yield to UI
+                    await new Promise(r => window.setTimeout(r, 0)); // yield to UI
                 }
                 const file = toIndex[fi] as TFile;
                 const content = await this.app.vault.read(file);
@@ -442,17 +442,16 @@ export class Indexer {
             }
 
             // Perform DB registry updates in batches to avoid WASM bridge overhead
-            await db.exec('BEGIN');
-            try {
+            await db.transaction(async (tx) => {
                 updateProgress('Clearing old embeddings...');
-                const allPaths = toIndex.map(f => (f as TFile).path);
+                const allPaths = toIndex.map(f => (f).path);
                 
                 // Batch DELETE
                 for (let i = 0; i < allPaths.length; i += 200) {
                     const batchPaths = allPaths.slice(i, i + 200);
                     const placeholders = batchPaths.map((_, idx) => `$${idx + 1}`).join(',');
-                    await db.query(`DELETE FROM embeddings WHERE path IN (${placeholders})`, batchPaths);
-                    await new Promise(r => setTimeout(r, 0)); // yield
+                    await tx.query(`DELETE FROM embeddings WHERE path IN (${placeholders})`, batchPaths);
+                    await new Promise(r => window.setTimeout(r, 0)); // yield
                 }
 
                 // Batch INSERT
@@ -464,13 +463,13 @@ export class Indexer {
                     let paramIdx = 1;
 
                     for (const file of batch) {
-                        const contentHash = fileHashes.get((file as TFile).path) || '';
+                        const contentHash = fileHashes.get((file).path) || '';
                         queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++})`);
-                        queryParams.push((file as TFile).path, Math.floor((file as TFile).stat.mtime), contentHash, this.maxChunkSize, this.prefix);
+                        queryParams.push((file).path, Math.floor((file).stat.mtime), contentHash, this.maxChunkSize, this.prefix);
                     }
 
                     if (queryValues.length > 0) {
-                        await db.query(
+                        await tx.query(
                             `INSERT INTO file_registry (path, mtime, hash, chunk_size, prefix) 
                              VALUES ${queryValues.join(',')} 
                              ON CONFLICT (path) DO UPDATE SET 
@@ -478,15 +477,11 @@ export class Indexer {
                             queryParams
                         );
                     }
-                    await new Promise(r => setTimeout(r, 0)); // yield
+                    await new Promise(r => window.setTimeout(r, 0)); // yield
                 }
                 
                 updateProgress(`Committing registry updates...`);
-                await db.exec('COMMIT');
-            } catch (e) {
-                await db.exec('ROLLBACK');
-                throw e;
-            }
+            });
 
             const BATCH_SIZE = this.plugin.settings.batchSize ?? 50;
             totalChunks = allChunks.length;
@@ -506,14 +501,16 @@ export class Indexer {
                     fetchPromise,
                     previousDbTask || Promise.resolve()
                 ]);
+
+                // Yield to ensure progress bar updates if fetch is very fast
+                await new Promise(r => window.setTimeout(r, 10));
                 
                 previousDbTask = (async () => {
                     let queryValues = [];
                     let queryParams = [];
                     let paramIdx = 1;
 
-                    await db.exec('BEGIN');
-                    try {
+                    await db.transaction(async (tx) => {
                         for (let j = 0; j < batch.length; j++) {
                             const item = batch[j];
                             const emb = embeddings[j];
@@ -534,17 +531,13 @@ export class Indexer {
                         }
 
                         if (queryValues.length > 0) {
-                            await db.query(
+                            await tx.query(
                                 `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
                                  VALUES ${queryValues.join(',')}`,
                                 queryParams
                             );
                         }
-                        await db.exec('COMMIT');
-                    } catch (txErr) {
-                        await db.exec('ROLLBACK');
-                        throw txErr;
-                    }
+                    });
                 })();
             }
             if (previousDbTask) {
@@ -691,14 +684,16 @@ export class Indexer {
                     fetchPromise,
                     previousDbTask || Promise.resolve()
                 ]);
+
+                // Yield to ensure UI remains responsive
+                await new Promise(r => window.setTimeout(r, 10));
                 
                 previousDbTask = (async () => {
                     let queryValues = [];
                     let queryParams = [];
                     let paramIdx = 1;
                     
-                    await db.exec('BEGIN');
-                    try {
+                    await db.transaction(async (tx) => {
                         for (let j = 0; j < batch.length; j++) {
                             const p = batch[j] as Chunk;
                             const emb = embeddings[j];
@@ -719,20 +714,16 @@ export class Indexer {
                         }
 
                         if (queryValues.length > 0) {
-                            await db.query(
+                            await tx.query(
                                 `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
                                  VALUES ${queryValues.join(',')}`,
                                 queryParams
                             );
                         }
-                        await db.exec('COMMIT');
-                    } catch (txErr) {
-                        await db.exec('ROLLBACK');
-                        throw txErr;
-                    }
+                    });
                 })();
                 
-                await new Promise(r => setTimeout(r, 0)); // yield to UI
+                await new Promise(r => window.setTimeout(r, 0)); // yield to UI
             }
             
             if (previousDbTask) {

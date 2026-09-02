@@ -35,13 +35,13 @@ export function buildSimilarTooltip(
     title: string,
     actions?: (res: QueryResult) => TooltipAction[]
 ): HTMLElement {
-    const dom = document.createElement('div');
+    const dom = createDiv();
     dom.className = 'embedding-hover-tooltip';
 
-    dom.createEl('div', { text: title, cls: 'embedding-hover-title' });
+    dom.createDiv({ text: title, cls: 'embedding-hover-title' });
 
     for (const res of results) {
-        const item = dom.createEl('div', { cls: 'embedding-hover-item' });
+        const item = dom.createDiv({ cls: 'embedding-hover-item' });
 
         const headerDiv = item.createDiv();
         const pathSpan = headerDiv.createEl('a', { text: res.path, href: '#', cls: 'embedding-hover-link' });
@@ -88,7 +88,7 @@ export function attachDismissHandler(tooltip: HTMLElement, onDismiss: () => void
             document.removeEventListener('mousedown', handler);
         }
     };
-    setTimeout(() => document.addEventListener('mousedown', handler), 0);
+    window.setTimeout(() => document.addEventListener('mousedown', handler), 0);
     return () => document.removeEventListener('mousedown', handler);
 }
 
@@ -210,7 +210,7 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
         let isInsideReadingView = false;
         let node = selection.anchorNode;
         while (node) {
-            if (node instanceof Element && node.classList.contains('markdown-reading-view')) {
+            if (node.instanceOf(Element) && node.classList.contains('markdown-reading-view')) {
                 isInsideReadingView = true;
                 break;
             }

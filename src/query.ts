@@ -119,10 +119,10 @@ export class QueryService {
             let linkedPaths = new Set<string>();
             if (excludePath) {
                 const resolvedLinks = this.plugin.app.metadataCache.resolvedLinks || {};
-                const outlinks = resolvedLinks[excludePath] || {};
+                const outlinks = (resolvedLinks as any)[excludePath] || {};
                 linkedPaths = new Set<string>(Object.keys(outlinks));
                 for (const [src, tgts] of Object.entries(resolvedLinks)) {
-                    if (tgts[excludePath]) linkedPaths.add(src);
+                    if ((tgts as any)[excludePath]) linkedPaths.add(src);
                 }
             }
 

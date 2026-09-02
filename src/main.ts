@@ -77,9 +77,9 @@ export default class EmbeddingViewerPlugin extends Plugin {
             }
 
             if (indexDebouncers.has(file.path)) {
-                clearTimeout(indexDebouncers.get(file.path)!);
+                window.clearTimeout(indexDebouncers.get(file.path));
             }
-            indexDebouncers.set(file.path, setTimeout(() => {
+            indexDebouncers.set(file.path, window.setTimeout(() => {
                 indexDebouncers.delete(file.path);
                 this.indexer.indexFile(file);
             }, this.settings.debounceTime || 15000));
@@ -116,7 +116,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
         const scheduleLog = (type: keyof typeof eventBatches, msg: string) => {
             eventBatches[type].add(msg);
             if (!batchLogTimeout) {
-                batchLogTimeout = setTimeout(logBatch, 2000);
+                batchLogTimeout = window.setTimeout(logBatch, 2000);
             }
         };
 
@@ -133,7 +133,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             if (file.path && file.path.endsWith('.md')) {
                 scheduleLog('delete', file.path);
                 if (indexDebouncers.has(file.path)) {
-                    clearTimeout(indexDebouncers.get(file.path)!);
+                    window.clearTimeout(indexDebouncers.get(file.path));
                     indexDebouncers.delete(file.path);
                 }
                 this.indexer.deleteFile(file.path);
