@@ -1,7 +1,8 @@
 import { StateField, StateEffect } from '@codemirror/state';
 import { EditorView, Tooltip, showTooltip, ViewPlugin, ViewUpdate } from '@codemirror/view';
-import { App, TFile, MarkdownView } from 'obsidian';
+import { App, TFile } from 'obsidian';
 import EmbeddingViewerPlugin from './main';
+import { QueryResult } from './query';
 
 export const setHoverTooltip = StateEffect.define<Tooltip | null>();
 
@@ -11,7 +12,6 @@ export const hoverTooltipField = StateField.define<Tooltip | null>({
         for (let e of tr.effects) {
             if (e.is(setHoverTooltip)) return e.value;
         }
-        // Hide tooltip if the document changes or selection changes (unless it's just a focus event)
         if (tr.docChanged || (tr.selection && !tr.effects.some(e => e.is(setHoverTooltip)))) {
             return null;
         }
@@ -22,6 +22,75 @@ export const hoverTooltipField = StateField.define<Tooltip | null>({
         return t ? [t] : [];
     })
 });
+
+export interface TooltipAction {
+    label: string;
+    title: string;
+    onClick: (res: QueryResult) => void;
+}
+
+export function buildSimilarTooltip(
+    app: App,
+    results: QueryResult[],
+    title: string,
+    actions?: (res: QueryResult) => TooltipAction[]
+): HTMLElement {
+    const dom = document.createElement('div');
+    dom.className = 'embedding-hover-tooltip';
+
+    dom.createEl('div', { text: title, cls: 'embedding-hover-title' });
+
+    for (const res of results) {
+        const item = dom.createEl('div', { cls: 'embedding-hover-item' });
+
+        const headerDiv = item.createDiv();
+        const pathSpan = headerDiv.createEl('a', { text: res.path, href: '#', cls: 'embedding-hover-link' });
+
+        pathSpan.onclick = async (e) => {
+            e.preventDefault();
+            const file = app.metadataCache.getFirstLinkpathDest(res.path, '');
+            if (file) {
+                const leaf = app.workspace.getLeaf(true);
+                await leaf.openFile(file, { eState: { line: res.startLine } });
+            } else {
+                app.workspace.openLinkText(res.path, '', true);
+            }
+        };
+
+        if (actions) {
+            for (const action of actions(res)) {
+                const btn = headerDiv.createEl('button', { text: action.label, cls: 'embedding-hover-insert-btn' });
+                btn.title = action.title;
+                btn.onclick = (e) => {
+                    e.preventDefault();
+                    action.onClick(res);
+                };
+            }
+        }
+
+        let scoreText = ` ${(res.similarity * 100).toFixed(0)}%`;
+        if (res.linkPenalty > 0) scoreText += ' 🔗↓';
+        const scoreSpan = headerDiv.createSpan({ text: scoreText, cls: 'embedding-hover-score' });
+        if (res.linkPenalty > 0) {
+            scoreSpan.title = `Penalized by -${Math.round(res.linkPenalty * 100)}% because it is already linked.`;
+        }
+
+        item.createDiv({ text: res.content, cls: 'embedding-hover-preview' });
+    }
+
+    return dom;
+}
+
+export function attachDismissHandler(tooltip: HTMLElement, onDismiss: () => void): () => void {
+    const handler = (e: MouseEvent) => {
+        if (!tooltip.contains(e.target as Node)) {
+            onDismiss();
+            document.removeEventListener('mousedown', handler);
+        }
+    };
+    setTimeout(() => document.addEventListener('mousedown', handler), 0);
+    return () => document.removeEventListener('mousedown', handler);
+}
 
 export function createHoverTooltipPlugin(app: App, plugin: EmbeddingViewerPlugin) {
     return ViewPlugin.fromClass(class {
@@ -58,98 +127,43 @@ export function createHoverTooltipPlugin(app: App, plugin: EmbeddingViewerPlugin
                 const activeFile = app.workspace.getActiveFile();
                 const excludePath = activeFile ? activeFile.path : undefined;
 
-                // Query top 3 similar chunks
                 const results = await plugin.queryService.findSimilarForVector(vector, excludePath, 3);
                 if (results.length === 0) return;
 
-                const dom = document.createElement('div');
-                dom.className = 'embedding-hover-tooltip';
-                dom.style.padding = '10px';
-                dom.style.maxWidth = '350px';
-                dom.style.backgroundColor = 'var(--background-primary)';
-                dom.style.border = '1px solid var(--background-modifier-border)';
-                dom.style.borderRadius = '8px';
-                dom.style.boxShadow = '0 8px 16px rgba(0,0,0,0.2)';
-                dom.style.zIndex = '1000';
-                dom.style.cursor = 'default';
-
-                const title = dom.createEl('div', { text: 'Similar Snippets', cls: 'embedding-hover-title' });
-                title.style.fontWeight = 'bold';
-                title.style.marginBottom = '8px';
-                title.style.fontSize = '0.95em';
-                title.style.color = 'var(--text-normal)';
-                title.style.borderBottom = '1px solid var(--background-modifier-border)';
-                title.style.paddingBottom = '4px';
-
-                for (const res of results) {
-                    const item = dom.createEl('div');
-                    item.style.marginBottom = '8px';
-                    item.style.fontSize = '0.85em';
-
-                    const headerDiv = item.createDiv();
-                    const pathSpan = headerDiv.createEl('a', { text: res.path, href: '#' });
-                    pathSpan.style.color = 'var(--text-accent)';
-                    pathSpan.style.textDecoration = 'none';
-                    pathSpan.style.fontWeight = '500';
-
-                    const insertBtn = headerDiv.createEl('button', { text: '🔗' });
-                    insertBtn.style.background = 'none';
-                    insertBtn.style.border = 'none';
-                    insertBtn.style.cursor = 'pointer';
-                    insertBtn.style.marginLeft = '4px';
-                    insertBtn.style.padding = '0 4px';
-                    insertBtn.title = 'Insert wikilink';
-                    
-                    const scoreSpan = headerDiv.createSpan({ text: ` ${(res.similarity * 100).toFixed(0)}%` });
-                    scoreSpan.style.color = 'var(--text-muted)';
-                    scoreSpan.style.float = 'right';
-                    scoreSpan.style.fontSize = '0.9em';
-
-                    const preview = item.createDiv({ text: res.content });
-                    preview.style.opacity = '0.85';
-                    preview.style.marginTop = '4px';
-                    preview.style.color = 'var(--text-normal)';
-                    preview.style.display = '-webkit-box';
-                    preview.style.webkitLineClamp = '3';
-                    preview.style.webkitBoxOrient = 'vertical';
-                    preview.style.overflow = 'hidden';
-                    preview.style.borderLeft = '2px solid var(--text-accent)';
-                    preview.style.paddingLeft = '6px';
-
-                    pathSpan.onclick = (e) => {
-                        e.preventDefault();
-                        app.workspace.openLinkText(res.path, '', true);
-                    };
-
-                    insertBtn.onclick = (e) => {
-                        e.preventDefault();
+                const view = this.view;
+                const dom = buildSimilarTooltip(app, results, 'Similar Snippets', (res) => [{
+                    label: '🔗',
+                    title: 'Insert wikilink',
+                    onClick: () => {
                         const file = app.vault.getAbstractFileByPath(res.path);
                         let linkPath = res.path.replace(/\.md$/, '');
                         if (file instanceof TFile) {
-                            const activeFile = app.workspace.getActiveFile();
-                            linkPath = app.metadataCache.fileToLinktext(file, activeFile ? activeFile.path : '');
+                            const active = app.workspace.getActiveFile();
+                            linkPath = app.metadataCache.fileToLinktext(file, active ? active.path : '');
                         }
-
-                        const alias = `[[${linkPath}|${text}]]`;
-                        this.view.dispatch({
-                            changes: {
-                                from: from,
-                                to: to,
-                                insert: alias
-                            },
+                        view.dispatch({
+                            changes: { from, to, insert: `[[${linkPath}|${text}]]` },
                             effects: setHoverTooltip.of(null)
                         });
-                    };
-                }
+                    }
+                }]);
 
                 this.view.dispatch({
                     effects: setHoverTooltip.of({
-                        pos: to, 
+                        pos: to,
                         above: false,
-                        create(view) { return { dom }; }
+                        create() { 
+                            return { 
+                                dom,
+                                mount() {
+                                    if (dom.parentElement) {
+                                        dom.parentElement.classList.add('embedding-cm-tooltip');
+                                    }
+                                }
+                            }; 
+                        }
                     })
                 });
-
             } catch (err) {
                 console.error('Hover search failed', err);
             }
@@ -165,16 +179,22 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
     let timer: number | null = null;
     let currentTooltip: HTMLElement | null = null;
 
+    let cleanupDismiss: (() => void) | null = null;
+
     const removeTooltip = () => {
         if (currentTooltip) {
             currentTooltip.remove();
             currentTooltip = null;
         }
+        if (cleanupDismiss) {
+            cleanupDismiss();
+            cleanupDismiss = null;
+        }
     };
 
     const onSelectionChange = () => {
         if (timer) window.clearTimeout(timer);
-        
+
         const selection = window.getSelection();
         if (!selection || selection.isCollapsed) {
             removeTooltip();
@@ -187,9 +207,6 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
             return;
         }
 
-
-
-        // Ensure selection is inside the reading view
         let isInsideReadingView = false;
         let node = selection.anchorNode;
         while (node) {
@@ -199,7 +216,6 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
             }
             node = node.parentNode;
         }
-        
         if (!isInsideReadingView) return;
 
         const range = selection.getRangeAt(0);
@@ -220,79 +236,15 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
 
                 removeTooltip();
 
-                const dom = document.createElement('div');
-                dom.className = 'embedding-hover-tooltip read-mode-tooltip';
+                const dom = buildSimilarTooltip(app, results, 'Similar Snippets');
+                dom.classList.add('read-mode-tooltip');
                 dom.style.position = 'absolute';
                 dom.style.left = `${rect.left}px`;
                 dom.style.top = `${rect.bottom + window.scrollY + 10}px`;
-                dom.style.padding = '10px';
-                dom.style.maxWidth = '350px';
-                dom.style.backgroundColor = 'var(--background-primary)';
-                dom.style.border = '1px solid var(--background-modifier-border)';
-                dom.style.borderRadius = '8px';
-                dom.style.boxShadow = '0 8px 16px rgba(0,0,0,0.2)';
-                dom.style.zIndex = '1000';
-                dom.style.cursor = 'default';
-
-                const title = dom.createEl('div', { text: 'Similar Snippets', cls: 'embedding-hover-title' });
-                title.style.fontWeight = 'bold';
-                title.style.marginBottom = '8px';
-                title.style.fontSize = '0.95em';
-                title.style.color = 'var(--text-normal)';
-                title.style.borderBottom = '1px solid var(--background-modifier-border)';
-                title.style.paddingBottom = '4px';
-
-                for (const res of results) {
-                    const item = dom.createEl('div');
-                    item.style.marginBottom = '8px';
-                    item.style.fontSize = '0.85em';
-
-                    const headerDiv = item.createDiv();
-                    const pathSpan = headerDiv.createEl('a', { text: res.path, href: '#' });
-                    pathSpan.style.color = 'var(--text-accent)';
-                    pathSpan.style.textDecoration = 'none';
-                    pathSpan.style.fontWeight = '500';
-                    
-                    const scoreSpan = headerDiv.createSpan({ text: ` ${(res.similarity * 100).toFixed(0)}%` });
-                    scoreSpan.style.color = 'var(--text-muted)';
-                    scoreSpan.style.float = 'right';
-                    scoreSpan.style.fontSize = '0.9em';
-
-                    const preview = item.createDiv({ text: res.content });
-                    preview.style.opacity = '0.85';
-                    preview.style.marginTop = '4px';
-                    preview.style.color = 'var(--text-normal)';
-                    preview.style.display = '-webkit-box';
-                    preview.style.webkitLineClamp = '3';
-                    preview.style.webkitBoxOrient = 'vertical';
-                    preview.style.overflow = 'hidden';
-                    preview.style.borderLeft = '2px solid var(--text-accent)';
-                    preview.style.paddingLeft = '6px';
-
-                    pathSpan.onclick = async (e) => {
-                        e.preventDefault();
-                        const file = app.metadataCache.getFirstLinkpathDest(res.path, '');
-                        if (file) {
-                            const leaf = app.workspace.getLeaf(true);
-                            await leaf.openFile(file, { eState: { line: res.startLine } });
-                        } else {
-                            app.workspace.openLinkText(res.path, '', true);
-                        }
-                    };
-                }
 
                 document.body.appendChild(dom);
                 currentTooltip = dom;
-
-                // Close on outside click
-                const onClickOutside = (e: MouseEvent) => {
-                    if (currentTooltip && !currentTooltip.contains(e.target as Node)) {
-                        removeTooltip();
-                        document.removeEventListener('mousedown', onClickOutside);
-                    }
-                };
-                setTimeout(() => document.addEventListener('mousedown', onClickOutside), 0);
-
+                cleanupDismiss = attachDismissHandler(dom, removeTooltip);
             } catch (err) {
                 console.error('Read mode hover search failed', err);
             }

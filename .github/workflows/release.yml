@@ -29,14 +29,14 @@ jobs:
             - name: Check for optional styles
               id: styles
               run: |
-                  [ -f styles.css ] && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
+                  [ -f build/styles.css ] && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
 
             - name: Attest build provenance
               uses: actions/attest@v4
               with:
                   subject-path: |
-                      main.js
-                      ${{ steps.styles.outputs.exists == 'true' && 'styles.css' || '' }}
+                      build/main.js
+                      ${{ steps.styles.outputs.exists == 'true' && 'build/styles.css' || '' }}
 
             - name: Create release
               env:
@@ -47,4 +47,4 @@ jobs:
                   gh release create "$tag" \
                     --title="$tag" \
                     --draft \
-                    main.js manifest.json ${{ steps.styles.outputs.exists == 'true' && 'styles.css' || '' }}
+                    build/main.js build/manifest.json ${{ steps.styles.outputs.exists == 'true' && 'build/styles.css' || '' }}

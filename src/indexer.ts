@@ -126,6 +126,7 @@ export class Indexer {
             for (const line of fileLines) {
                 counts.set(line, (counts.get(line) || 0) + 1);
             }
+            await new Promise(resolve => setTimeout(resolve, 0)); // yield to UI
         }
         
         // Phrases that appear in > 10% of sampled files or at least 5 files
@@ -281,14 +282,21 @@ export class Indexer {
     }
 
     public async embed(texts: string[], dimension?: number): Promise<number[][]> {
-        const res = await fetch(`${this.endpoint}/v1/embeddings`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: this.model, input: texts, encoding_format: 'float' })
-        });
-        if (!res.ok) throw new Error(`Embedding API ${res.status}: ${await res.text()}`);
-        const { data } = await res.json();
-        return data.map((d: any) => d.embedding);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 seconds timeout
+        try {
+            const res = await fetch(`${this.endpoint}/v1/embeddings`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: this.model, input: texts, encoding_format: 'float' }),
+                signal: controller.signal
+            });
+            if (!res.ok) throw new Error(`Embedding API ${res.status}: ${await res.text()}`);
+            const { data } = await res.json();
+            return data.map((d: any) => d.embedding);
+        } finally {
+            clearTimeout(timeoutId);
+        }
     }
 
     async rebuildIndex(progressCallback?: (msg: string | null) => void, force: boolean = false) {
@@ -298,6 +306,9 @@ export class Indexer {
             await this._rebuildIndex(progressCallback, force);
         } finally {
             this.isIndexing = false;
+            if (this.fileIndexQueue.length > 0) {
+                this.processQueue();
+            }
         }
     }
 
@@ -306,7 +317,7 @@ export class Indexer {
             if (progressCallback) progressCallback(msg);
         };
 
-        const db = await this.dbManager.getDb();
+        let db = await this.dbManager.getDb();
         if (!db) return;
 
         try {
@@ -326,9 +337,11 @@ export class Indexer {
             }
 
             if (force) {
+                updateProgress(`Force rebuilding index...`);
                 new Notice(`Force rebuilding index...`);
-                await db.query('TRUNCATE embeddings');
-                await db.query('TRUNCATE file_registry');
+                await this.dbManager.resetData();
+                db = await this.dbManager.getDb();
+                if (!db) return;
             }
 
             const { rows } = await db.query('SELECT model, dimension, metadata FROM embeddings LIMIT 1');
@@ -341,8 +354,9 @@ export class Indexer {
                     meta.prefix !== this.prefix ||
                     meta.excludedFolders !== this.plugin.settings.excludedFolders) {
                     new Notice(`Settings changed. Full rebuild required.`);
-                    await db.query('TRUNCATE embeddings');
-                    await db.query('TRUNCATE file_registry');
+                    await this.dbManager.resetData();
+                    db = await this.dbManager.getDb();
+                    if (!db) return;
                 }
             }
 
@@ -408,31 +422,73 @@ export class Indexer {
             let totalChunks = 0;
             
             let allChunks: { file: TFile, chunk: Chunk, contentHash: string }[] = [];
+            let fileHashes = new Map<string, string>();
+            
             for (let fi = 0; fi < toIndex.length; fi++) {
-                updateProgress(`Preparing ${fi + 1}/${toIndex.length} files...`);
+                if (fi % 10 === 0) {
+                    updateProgress(`Preparing ${fi + 1}/${toIndex.length} files...`);
+                    await new Promise(r => setTimeout(r, 0)); // yield to UI
+                }
                 const file = toIndex[fi] as TFile;
                 const content = await this.app.vault.read(file);
                 const contentHash = this.hashString(content);
+                fileHashes.set(file.path, contentHash);
                 
-                await db.query('DELETE FROM embeddings WHERE path = $1', [file.path]);
-
-                console.log(`[Embedding Viewer] Manual index extracting chunks for: ${file.path}`);
                 const chunks = this.extractChunks(content, file, dynamicExcludedPhrases);
                 
-                await db.query(
-                    `INSERT INTO file_registry (path, mtime, hash, chunk_size, prefix) 
-                     VALUES ($1, $2, $3, $4, $5) 
-                     ON CONFLICT (path) DO UPDATE SET 
-                     mtime = EXCLUDED.mtime, hash = EXCLUDED.hash, chunk_size = EXCLUDED.chunk_size, prefix = EXCLUDED.prefix`,
-                    [file.path, Math.floor(file.stat.mtime), contentHash, this.maxChunkSize, this.prefix]
-                );
-
                 for (const chunk of chunks) {
                     allChunks.push({ file, chunk, contentHash });
                 }
             }
 
-            const BATCH_SIZE = 10;
+            // Perform DB registry updates in batches to avoid WASM bridge overhead
+            await db.exec('BEGIN');
+            try {
+                updateProgress('Clearing old embeddings...');
+                const allPaths = toIndex.map(f => (f as TFile).path);
+                
+                // Batch DELETE
+                for (let i = 0; i < allPaths.length; i += 200) {
+                    const batchPaths = allPaths.slice(i, i + 200);
+                    const placeholders = batchPaths.map((_, idx) => `$${idx + 1}`).join(',');
+                    await db.query(`DELETE FROM embeddings WHERE path IN (${placeholders})`, batchPaths);
+                    await new Promise(r => setTimeout(r, 0)); // yield
+                }
+
+                // Batch INSERT
+                for (let i = 0; i < toIndex.length; i += 200) {
+                    updateProgress(`Updating registry ${Math.min(i + 200, toIndex.length)}/${toIndex.length}...`);
+                    const batch = toIndex.slice(i, i + 200);
+                    let queryValues = [];
+                    let queryParams = [];
+                    let paramIdx = 1;
+
+                    for (const file of batch) {
+                        const contentHash = fileHashes.get((file as TFile).path) || '';
+                        queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++})`);
+                        queryParams.push((file as TFile).path, Math.floor((file as TFile).stat.mtime), contentHash, this.maxChunkSize, this.prefix);
+                    }
+
+                    if (queryValues.length > 0) {
+                        await db.query(
+                            `INSERT INTO file_registry (path, mtime, hash, chunk_size, prefix) 
+                             VALUES ${queryValues.join(',')} 
+                             ON CONFLICT (path) DO UPDATE SET 
+                             mtime = EXCLUDED.mtime, hash = EXCLUDED.hash, chunk_size = EXCLUDED.chunk_size, prefix = EXCLUDED.prefix`,
+                            queryParams
+                        );
+                    }
+                    await new Promise(r => setTimeout(r, 0)); // yield
+                }
+                
+                updateProgress(`Committing registry updates...`);
+                await db.exec('COMMIT');
+            } catch (e) {
+                await db.exec('ROLLBACK');
+                throw e;
+            }
+
+            const BATCH_SIZE = this.plugin.settings.batchSize ?? 50;
             totalChunks = allChunks.length;
             
             let previousDbTask: Promise<void> | null = null;
@@ -457,33 +513,38 @@ export class Indexer {
                     let paramIdx = 1;
 
                     await db.exec('BEGIN');
-                    for (let j = 0; j < batch.length; j++) {
-                        const item = batch[j];
-                        const emb = embeddings[j];
-                        if (!item || !emb) continue;
-                        
-                        const meta = JSON.stringify({
-                            startLine: item.chunk.startLine, 
-                            endLine: item.chunk.endLine, 
-                            heading: item.chunk.heading,
-                            chunkSize: this.maxChunkSize,
-                            prefix: this.prefix,
-                            excludedFolders: this.plugin.settings.excludedFolders,
-                            fileHash: item.contentHash
-                        });
+                    try {
+                        for (let j = 0; j < batch.length; j++) {
+                            const item = batch[j];
+                            const emb = embeddings[j];
+                            if (!item || !emb) continue;
+                            
+                            const meta = JSON.stringify({
+                                startLine: item.chunk.startLine, 
+                                endLine: item.chunk.endLine, 
+                                heading: item.chunk.heading,
+                                chunkSize: this.maxChunkSize,
+                                prefix: this.prefix,
+                                excludedFolders: this.plugin.settings.excludedFolders,
+                                fileHash: item.contentHash
+                            });
 
-                        queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
-                        queryParams.push(item.file.path, Math.floor(item.file.stat.mtime), item.chunk.content, this.model, dimension, `[${emb.join(',')}]`, meta);
-                    }
+                            queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
+                            queryParams.push(item.file.path, Math.floor(item.file.stat.mtime), item.chunk.content, this.model, dimension, `[${emb.join(',')}]`, meta);
+                        }
 
-                    if (queryValues.length > 0) {
-                        await db.query(
-                            `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
-                             VALUES ${queryValues.join(',')}`,
-                            queryParams
-                        );
+                        if (queryValues.length > 0) {
+                            await db.query(
+                                `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
+                                 VALUES ${queryValues.join(',')}`,
+                                queryParams
+                            );
+                        }
+                        await db.exec('COMMIT');
+                    } catch (txErr) {
+                        await db.exec('ROLLBACK');
+                        throw txErr;
                     }
-                    await db.exec('COMMIT');
                 })();
             }
             if (previousDbTask) {
@@ -493,6 +554,8 @@ export class Indexer {
             updateProgress(`Finalizing index...`);
             if (dimension <= 2000) {
                 await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
+            } else if (dimension <= 4000) {
+                await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw ((embedding::halfvec(${dimension})) halfvec_cosine_ops)`);
             }
             await this.dbManager.saveDb();
             
@@ -512,8 +575,6 @@ export class Indexer {
     private isProcessingQueue = false;
 
     async indexFile(file: TFile) {
-        if (this.isIndexing) return;
-
         const excluded = this.plugin.settings.excludedFolders
             .split('\n')
             .map(f => f.trim())
@@ -529,6 +590,8 @@ export class Indexer {
         if (!this.fileIndexQueue.some(f => f.path === file.path)) {
             this.fileIndexQueue.push(file);
         }
+        
+        if (this.isIndexing) return;
         this.processQueue();
     }
 
@@ -552,6 +615,8 @@ export class Indexer {
                     await db.query(`ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dimension})`);
                     if (dimension <= 2000) {
                         await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
+                    } else if (dimension <= 4000) {
+                        await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw ((embedding::halfvec(${dimension})) halfvec_cosine_ops)`);
                     }
                     this.schemaVerified = true;
                 } catch (e) {
@@ -560,13 +625,17 @@ export class Indexer {
             }
         } catch (e) {
             console.error("Probe failed in processQueue:", e);
+            new Notice("Embedding server disconnected. Background indexing paused.");
+            if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
+            this.isProcessingQueue = false;
+            return;
         }
 
         while (this.fileIndexQueue.length > 0) {
             const file = this.fileIndexQueue.shift();
             if (!file) continue;
 
-            console.log(`[Embedding Viewer] processQueue dequeued file: ${file.path}`);
+            console.debug(`[Embedding Viewer] processQueue dequeued file: ${file.path}`);
 
             try {
 
@@ -577,16 +646,16 @@ export class Indexer {
             if (rows.length > 0) {
                 const reg = rows[0] as any;
                 if (reg.hash === contentHash && reg.chunk_size === this.maxChunkSize && reg.prefix === this.prefix) {
-                    console.log(`[Embedding Viewer] Cache hit for ${file.path} (hash: ${contentHash}). Skipping full index.`);
+                    console.debug(`[Embedding Viewer] Cache hit for ${file.path} (hash: ${contentHash}). Skipping full index.`);
                     if (Math.floor(Number(reg.mtime)) !== Math.floor(file.stat.mtime)) {
-                        console.log(`[Embedding Viewer] Cache mtime drift detected for ${file.path} (DB: ${reg.mtime} vs File: ${file.stat.mtime}). Updating mtime.`);
+                        console.debug(`[Embedding Viewer] Cache mtime drift detected for ${file.path} (DB: ${reg.mtime} vs File: ${file.stat.mtime}). Updating mtime.`);
                         await db.query('UPDATE file_registry SET mtime = $1 WHERE path = $2', [Math.floor(file.stat.mtime), file.path]);
                     }
                     continue;
                 }
-                console.log(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Hash changed (${reg.hash} -> ${contentHash}) or settings changed.`);
+                console.debug(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Hash changed (${reg.hash} -> ${contentHash}) or settings changed.`);
             } else {
-                console.log(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Not in registry.`);
+                console.debug(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Not in registry.`);
             }
 
             if (this.plugin.statusBarItem) {
@@ -608,46 +677,66 @@ export class Indexer {
 
             if (chunks.length === 0) continue;
 
-            const BATCH_SIZE = 20;
+            const BATCH_SIZE = this.plugin.settings.batchSize ?? 50;
+            let previousDbTask: Promise<void> | null = null;
+            
             for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
                 const batch = chunks.slice(i, i + BATCH_SIZE);
-                const embeddings = await this.embed(batch.map(p => {
+                const fetchPromise = this.embed(batch.map(p => {
                     const text = `${this.prefix}${p.embedText}`;
                     return text.length > 4000 ? text.substring(0, 4000) : text;
                 }), dimension);
                 
-                let queryValues = [];
-                let queryParams = [];
-                let paramIdx = 1;
+                const [embeddings] = await Promise.all([
+                    fetchPromise,
+                    previousDbTask || Promise.resolve()
+                ]);
                 
-                await db.exec('BEGIN');
-                for (let j = 0; j < batch.length; j++) {
-                    const p = batch[j] as Chunk;
-                    const emb = embeddings[j];
-                    if (!emb) continue;
+                previousDbTask = (async () => {
+                    let queryValues = [];
+                    let queryParams = [];
+                    let paramIdx = 1;
                     
-                    const meta = JSON.stringify({
-                        startLine: p.startLine, 
-                        endLine: p.endLine, 
-                        heading: p.heading,
-                        chunkSize: this.maxChunkSize,
-                        prefix: this.prefix,
-                        excludedFolders: this.plugin.settings.excludedFolders,
-                        fileHash: contentHash
-                    });
+                    await db.exec('BEGIN');
+                    try {
+                        for (let j = 0; j < batch.length; j++) {
+                            const p = batch[j] as Chunk;
+                            const emb = embeddings[j];
+                            if (!emb) continue;
+                            
+                            const meta = JSON.stringify({
+                                startLine: p.startLine, 
+                                endLine: p.endLine, 
+                                heading: p.heading,
+                                chunkSize: this.maxChunkSize,
+                                prefix: this.prefix,
+                                excludedFolders: this.plugin.settings.excludedFolders,
+                                fileHash: contentHash
+                            });
 
-                    queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
-                    queryParams.push(file.path, Math.floor(file.stat.mtime), p.content, this.model, dimension, `[${emb.join(',')}]`, meta);
-                }
+                            queryValues.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++})`);
+                            queryParams.push(file.path, Math.floor(file.stat.mtime), p.content, this.model, dimension, `[${emb.join(',')}]`, meta);
+                        }
 
-                if (queryValues.length > 0) {
-                    await db.query(
-                        `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
-                         VALUES ${queryValues.join(',')}`,
-                        queryParams
-                    );
-                }
-                await db.exec('COMMIT');
+                        if (queryValues.length > 0) {
+                            await db.query(
+                                `INSERT INTO embeddings (path, mtime, content, model, dimension, embedding, metadata)
+                                 VALUES ${queryValues.join(',')}`,
+                                queryParams
+                            );
+                        }
+                        await db.exec('COMMIT');
+                    } catch (txErr) {
+                        await db.exec('ROLLBACK');
+                        throw txErr;
+                    }
+                })();
+                
+                await new Promise(r => setTimeout(r, 0)); // yield to UI
+            }
+            
+            if (previousDbTask) {
+                await previousDbTask;
             }
         } catch (err) {
             console.error(`Error indexing file ${file.path}:`, err);
@@ -664,7 +753,15 @@ export class Indexer {
         if (this.isIndexing) return;
         const db = await this.dbManager.getDb();
         if (!db) return;
-        await db.query('DELETE FROM embeddings WHERE path = $1', [path]);
-        await db.query('DELETE FROM file_registry WHERE path = $1', [path]);
+        try {
+            await db.query('DELETE FROM embeddings WHERE path = $1', [path]);
+            await db.query('DELETE FROM file_registry WHERE path = $1', [path]);
+        } catch (e: any) {
+            if (e.message && e.message.includes('closing')) {
+                // Ignore if DB is being destroyed
+            } else {
+                console.error('Error in deleteFile:', e);
+            }
+        }
     }
 }

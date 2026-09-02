@@ -47,7 +47,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
         
         this.registerDomEvent(window, 'beforeunload', () => this.cleanupProcess());
 
-        this.dbManager = new DatabaseManager(this.app);
+        this.dbManager = new DatabaseManager(this);
         
         // Wait for DB to be ready
         await this.dbManager.getDb();
@@ -63,28 +63,75 @@ export default class EmbeddingViewerPlugin extends Plugin {
         
         const scheduleIndex = (file: any, eventName: string) => {
             if (file.extension !== 'md') return;
+
+            const excluded = this.settings.excludedFolders
+                .split('\n')
+                .map((f: string) => f.trim())
+                .filter((f: string) => f.length > 0);
+
+            for (const ex of excluded) {
+                if (file.path.startsWith(ex)) {
+                    this.indexer.deleteFile(file.path);
+                    return;
+                }
+            }
+
             if (indexDebouncers.has(file.path)) {
                 clearTimeout(indexDebouncers.get(file.path)!);
             }
             indexDebouncers.set(file.path, setTimeout(() => {
                 indexDebouncers.delete(file.path);
-                console.log(`[Embedding Viewer] Queueing file for indexing (Event-driven: ${eventName}):`, file.path);
                 this.indexer.indexFile(file);
             }, this.settings.debounceTime || 15000));
         };
         
+        const eventBatches = {
+            create: new Set<string>(),
+            modify: new Set<string>(),
+            delete: new Set<string>(),
+            rename: new Set<string>()
+        };
+        let batchLogTimeout: any = null;
+
+        const logBatch = () => {
+            if (eventBatches.create.size > 0) {
+                console.log(`[Embedding Viewer] Files created (${eventBatches.create.size}):`, Array.from(eventBatches.create));
+                eventBatches.create.clear();
+            }
+            if (eventBatches.modify.size > 0) {
+                console.log(`[Embedding Viewer] Files modified (${eventBatches.modify.size}):`, Array.from(eventBatches.modify));
+                eventBatches.modify.clear();
+            }
+            if (eventBatches.delete.size > 0) {
+                console.log(`[Embedding Viewer] Files deleted (${eventBatches.delete.size}):`, Array.from(eventBatches.delete));
+                eventBatches.delete.clear();
+            }
+            if (eventBatches.rename.size > 0) {
+                console.log(`[Embedding Viewer] Files renamed (${eventBatches.rename.size}):`, Array.from(eventBatches.rename));
+                eventBatches.rename.clear();
+            }
+            batchLogTimeout = null;
+        };
+
+        const scheduleLog = (type: keyof typeof eventBatches, msg: string) => {
+            eventBatches[type].add(msg);
+            if (!batchLogTimeout) {
+                batchLogTimeout = setTimeout(logBatch, 2000);
+            }
+        };
+
         this.registerEvent(this.app.vault.on('modify', (file) => {
-            console.log(`[Embedding Viewer] File modified event:`, file.path);
+            scheduleLog('modify', file.path);
             scheduleIndex(file, 'modify');
         }));
         this.registerEvent(this.app.vault.on('create', (file) => {
-            console.log(`[Embedding Viewer] File created event:`, file.path);
+            scheduleLog('create', file.path);
             scheduleIndex(file, 'create');
         }));
         
         this.registerEvent(this.app.vault.on('delete', (file) => {
             if (file.path && file.path.endsWith('.md')) {
-                console.log(`[Embedding Viewer] File deleted event:`, file.path);
+                scheduleLog('delete', file.path);
                 if (indexDebouncers.has(file.path)) {
                     clearTimeout(indexDebouncers.get(file.path)!);
                     indexDebouncers.delete(file.path);
@@ -95,7 +142,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
         
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
             if (file.path && file.path.endsWith('.md')) {
-                console.log(`[Embedding Viewer] File renamed event: ${oldPath} -> ${file.path}`);
+                scheduleLog('rename', `${oldPath} -> ${file.path}`);
                 this.indexer.deleteFile(oldPath);
                 scheduleIndex(file, 'rename');
             }

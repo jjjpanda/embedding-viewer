@@ -14,7 +14,7 @@ export interface EmbeddingViewerSettings {
     apiPort: number;
     onLaunchCommand: string;
     lastExcludedPhrases: string[];
-    graphLayers: number;
+    batchSize: number;
 }
 
 export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
@@ -30,7 +30,7 @@ export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
     apiPort: 27123,
     onLaunchCommand: '',
     lastExcludedPhrases: [],
-    graphLayers: 5,
+    batchSize: 50,
 };
 
 export class EmbeddingViewerSettingTab extends PluginSettingTab {
@@ -98,6 +98,20 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
+            .setName('Batch Size')
+            .setDesc('Number of text chunks to embed in a single request. (Default 50)')
+            .addText(text => text
+                .setPlaceholder('50')
+                .setValue(this.plugin.settings.batchSize.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value, 10);
+                    if (!isNaN(parsed)) {
+                        this.plugin.settings.batchSize = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
             .setName('Indexing Debounce Time (ms)')
             .setDesc('Milliseconds to wait after you stop typing before indexing a file. Increase this if indexing feels laggy while you edit (default 15000).')
             .addText(text => text
@@ -151,23 +165,6 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                         this.plugin.settings.maximumSimilarity = parsed;
                         await this.plugin.saveSettings();
                     }
-                }));
-
-        new Setting(containerEl)
-            .setName('Graph Layers')
-            .setDesc('Number of recursive layers to fetch for the Similar Documents Graph.')
-            .addSlider(slider => slider
-                .setLimits(1, 8, 1)
-                .setValue(this.plugin.settings.graphLayers)
-                .setDynamicTooltip()
-                .onChange(async (value) => {
-                    this.plugin.settings.graphLayers = value;
-                    await this.plugin.saveSettings();
-                    this.plugin.app.workspace.getLeavesOfType('similar-notes-view').forEach(leaf => {
-                        if (leaf.view && (leaf.view as any).updateView) {
-                            (leaf.view as any).updateView();
-                        }
-                    });
                 }));
 
         containerEl.createEl('h3', { text: 'Advanced' });

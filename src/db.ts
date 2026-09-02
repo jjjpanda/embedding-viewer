@@ -1,13 +1,14 @@
-import { App, Notice } from 'obsidian';
+import { Notice } from 'obsidian';
 import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite-pgvector';
+import EmbeddingViewerPlugin from './main';
 
 export class DatabaseManager {
-    private app: App;
+    private plugin: EmbeddingViewerPlugin;
     private db: PGlite | null = null;
 
-    constructor(app: App) {
-        this.app = app;
+    constructor(plugin: EmbeddingViewerPlugin) {
+        this.plugin = plugin;
     }
 
     async getDb(): Promise<PGlite | null> {
@@ -29,7 +30,7 @@ export class DatabaseManager {
         }
     }
 
-    private async initSchema(db: PGlite) {
+    async initSchema(db: PGlite) {
         await db.exec(`
             CREATE EXTENSION IF NOT EXISTS vector;
             CREATE TABLE IF NOT EXISTS embeddings (
@@ -64,15 +65,29 @@ export class DatabaseManager {
             ON CONFLICT (path) DO NOTHING;
         `);
 
-        try {
-            await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
-        } catch (e) {
-            console.log("Could not create HNSW index yet (might need dimension):", e);
-        }
+        // HNSW index is created in indexer.ts after the embedding dimension is known.
     }
 
     async saveDb() {
         // No-op for IndexedDB since it automatically persists
+    }
+
+    async resetData() {
+        if (!this.db) return;
+        // Drop tables which is often faster than TRUNCATE in IDB VFS
+        await this.db.exec(`
+            DROP TABLE IF EXISTS embeddings CASCADE;
+            DROP TABLE IF EXISTS file_registry CASCADE;
+        `);
+        // Re-initialize the schema immediately
+        await this.initSchema(this.db);
+    }
+
+    async destroyDb() {
+        if (this.db) {
+            await this.db.close();
+            this.db = null;
+        }
     }
 
     async close() {

@@ -24,11 +24,84 @@
 }
 
 .embedding-chunk-highlight-1 {
-    background-color: rgba(100, 149, 237, 0.15); /* Cornflower blue */
+    background-color: rgba(100, 149, 237, 0.15);
     border-left: 3px solid rgba(100, 149, 237, 0.4);
 }
 
 .embedding-chunk-highlight-2 {
-    background-color: rgba(237, 100, 100, 0.15); /* Light red */
+    background-color: rgba(237, 100, 100, 0.15);
     border-left: 3px solid rgba(237, 100, 100, 0.4);
+}
+
+.cm-tooltip.embedding-cm-tooltip {
+    background-color: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+    z-index: 1000;
+    color: var(--text-normal);
+}
+
+.cm-tooltip.embedding-cm-tooltip .embedding-hover-tooltip {
+    border: none;
+    box-shadow: none;
+    background-color: transparent;
+}
+
+.embedding-hover-tooltip {
+    padding: 10px;
+    max-width: 350px;
+    background-color: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+    z-index: 1000;
+    cursor: default;
+    color: var(--text-normal);
+}
+
+.embedding-hover-title {
+    font-weight: bold;
+    margin-bottom: 8px;
+    font-size: 0.95em;
+    color: var(--text-normal);
+    border-bottom: 1px solid var(--background-modifier-border);
+    padding-bottom: 4px;
+}
+
+.embedding-hover-item {
+    margin-bottom: 8px;
+    font-size: 0.85em;
+}
+
+.embedding-hover-link {
+    color: var(--text-accent);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.embedding-hover-score {
+    color: var(--text-muted);
+    float: right;
+    font-size: 0.9em;
+}
+
+.embedding-hover-preview {
+    opacity: 0.85;
+    margin-top: 4px;
+    color: var(--text-normal);
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    border-left: 2px solid var(--text-accent);
+    padding-left: 6px;
+}
+
+.embedding-hover-insert-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    margin-left: 4px;
+    padding: 0 4px;
 }
