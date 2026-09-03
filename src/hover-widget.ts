@@ -111,7 +111,7 @@ export function createHoverTooltipPlugin(app: App, plugin: EmbeddingViewerPlugin
                 if (!selection.empty) {
                     const text = state.doc.sliceString(selection.from, selection.to).trim();
                     if (text) {
-                        this.timer = window.setTimeout(() => this.triggerSearch(text, selection.from, selection.to), 800);
+                        this.timer = window.setTimeout(() => this.triggerSearch(text, selection.from, selection.to), 300);
                     }
                 }
             }
@@ -248,7 +248,7 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
             } catch (err) {
                 console.error('Read mode hover search failed', err);
             }
-        }, 800);
+        }, 300);
     };
 
     plugin.registerDomEvent(document, 'selectionchange', onSelectionChange);

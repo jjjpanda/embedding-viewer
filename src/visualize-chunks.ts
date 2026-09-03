@@ -188,7 +188,7 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                     this.triggerHover(chunk, text, file, e.clientX, e.clientY).catch(err => {
                         console.error('Hover trigger failed:', err);
                     }); 
-                }, 800);
+                }, 300);
             }
 
             async triggerHover(_chunk: Chunk, text: string, file: TFile, x: number, y: number) {
