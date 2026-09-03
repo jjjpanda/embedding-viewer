@@ -15,6 +15,7 @@ export interface EmbeddingViewerSettings {
     onLaunchCommand: string;
     lastExcludedPhrases: string[];
     batchSize: number;
+    bulkIndexThreshold: number;
 }
 
 export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
@@ -31,6 +32,7 @@ export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
     onLaunchCommand: '',
     lastExcludedPhrases: [],
     batchSize: 50,
+    bulkIndexThreshold: 20,
 };
 
 export class EmbeddingViewerSettingTab extends PluginSettingTab {
@@ -107,6 +109,20 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     const parsed = parseInt(value, 10);
                     if (!isNaN(parsed) && parsed > 0) {
                         this.plugin.settings.batchSize = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Bulk Index Threshold')
+            .setDesc('If more than this many files are queued for indexing, trigger a fast multi-file rebuild instead. (Default 20)')
+            .addText(text => text
+                .setPlaceholder('20')
+                .setValue(this.plugin.settings.bulkIndexThreshold.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value, 10);
+                    if (!isNaN(parsed) && parsed > 0) {
+                        this.plugin.settings.bulkIndexThreshold = parsed;
                         await this.plugin.saveSettings();
                     }
                 }));

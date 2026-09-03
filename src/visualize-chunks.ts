@@ -202,7 +202,7 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                     if (results.length === 0) return;
 
                     const dom = buildSimilarTooltip(app, results, 'Similar Snippets (Chunk)');
-                    dom.classList.add('read-mode-tooltip');
+                    dom.classList.add('read-mode-tooltip', 'embedding-popup-container');
                     dom.style.position = 'absolute';
                     dom.style.left = `${x}px`;
                     dom.style.top = `${y + 20}px`;

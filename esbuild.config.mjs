@@ -107,14 +107,58 @@ const context = await esbuild.context({
 	logLevel: 'info',
 	sourcemap: prod ? false : 'inline',
 	treeShaking: true,
-	outfile: path.join(outDir, 'main.js'),
-	minify: prod,
+	outdir: outDir,
+	minify: false,
 	plugins: [copyAndReplacePlugin],
+});
+
+const workerCopyPlugin = {
+	name: 'worker-copy-plugin',
+	setup(build) {
+		build.onEnd(() => {
+			if (vaultPath) {
+				const pluginDir = path.join(vaultPath, '.obsidian', 'plugins', 'embedding-viewer');
+				const workerSrc = path.join(outDir, 'worker.js');
+				if (fs.existsSync(workerSrc)) {
+					fs.copyFileSync(workerSrc, path.join(pluginDir, 'worker.js'));
+				}
+			}
+		});
+	}
+};
+
+const workerReplacePlugin = {
+	name: 'worker-replace-plugin',
+	setup(build) {
+		build.onLoad({ filter: /pglite/ }, async (args) => {
+			let text = await fs.promises.readFile(args.path, 'utf8');
+			text = text.replace(/import\.meta\.url/g, "self.WORKER_BASE_URL");
+			return { contents: text, loader: 'js' };
+		});
+	}
+};
+
+const workerContext = await esbuild.context({
+	entryPoints: ['src/worker.ts'],
+	bundle: true,
+	format: 'iife',
+	target: 'es2021',
+	logLevel: 'info',
+	sourcemap: prod ? false : 'inline',
+	treeShaking: true,
+	outfile: path.join(outDir, 'worker.js'),
+	minify: prod,
+	define: {
+		'process.browser': 'true'
+	},
+	plugins: [workerCopyPlugin, workerReplacePlugin],
 });
 
 if (prod) {
 	await context.rebuild();
+	await workerContext.rebuild();
 	process.exit(0);
 } else {
 	await context.watch();
+	await workerContext.watch();
 }

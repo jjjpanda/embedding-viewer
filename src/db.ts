@@ -1,33 +1,64 @@
 import { Notice } from 'obsidian';
 import { PGlite } from '@electric-sql/pglite';
+// @ts-ignore
+import { PGliteWorker } from '@electric-sql/pglite/worker';
 import { vector } from '@electric-sql/pglite-pgvector';
 import EmbeddingViewerPlugin from './main';
 
 export class DatabaseManager {
     private plugin: EmbeddingViewerPlugin;
-    private db: PGlite | null = null;
+    private db: PGliteWorker | null = null;
+
+    private initPromise: Promise<PGliteWorker | null> | null = null;
 
     constructor(plugin: EmbeddingViewerPlugin) {
         this.plugin = plugin;
     }
 
-    async getDb(): Promise<PGlite | null> {
+    async getDb(): Promise<PGliteWorker | null> {
         if (this.db) {
             return this.db;
         }
-
-        try {
-            // Using IndexedDB makes it compatible across platforms and faster
-            this.db = await PGlite.create('idb://embedding-viewer', {
-                extensions: { vector }
-            });
-            await this.initSchema(this.db);
-            return this.db;
-        } catch (error) {
-            console.error('Failed to initialize database:', error);
-            new Notice('Failed to load Vector DB. See console for details.');
-            return null;
+        if (this.initPromise) {
+            return this.initPromise;
         }
+
+        this.initPromise = (async () => {
+            try {
+                const workerJs = await this.plugin.app.vault.adapter.read(this.plugin.manifest.dir + '/worker.js');
+                
+                const resourceBasePath = (this.plugin.app.vault.adapter as any).getResourcePath(this.plugin.manifest.dir + '/').split('?')[0];
+                const scriptPrefix = `self.WORKER_BASE_URL = "${resourceBasePath}worker.js";\nself.process = { browser: true };\n`;
+                
+                const blob = new Blob([scriptPrefix + workerJs], { type: 'application/javascript' });
+                const workerUrl = URL.createObjectURL(blob);
+                const worker = new Worker(workerUrl);
+
+                // Add error listener to catch worker initialization errors
+                worker.onerror = (e) => {
+                    console.error("Worker error:", e.message, e.lineno);
+                };
+
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('PGlite Worker initialization timed out after 5000ms')), 5000)
+                );
+                
+                this.db = await Promise.race([
+                    PGliteWorker.create(worker, {
+                        dataDir: 'idb://embedding-viewer'
+                    }),
+                    timeoutPromise
+                ]) as PGliteWorker;
+                
+                await this.initSchema(this.db as any);
+                return this.db;
+            } catch (error) {
+                console.error('Failed to initialize database:', error);
+                new Notice('Failed to load Vector DB Worker. See console for details.');
+                return null;
+            }
+        })();
+        return this.initPromise;
     }
 
     async initSchema(db: PGlite) {

@@ -153,13 +153,23 @@ export function createHoverTooltipPlugin(app: App, plugin: EmbeddingViewerPlugin
                         pos: to,
                         above: false,
                         create() { 
-                            return { 
-                                dom,
-                                mount() {
-                                    if (dom.parentElement) {
-                                        dom.parentElement.classList.add('embedding-cm-tooltip');
-                                    }
+                            let attempts = 0;
+                            const checkParent = () => {
+                                let parent = dom.parentElement;
+                                while (parent && !parent.classList.contains('cm-tooltip')) {
+                                    parent = parent.parentElement;
                                 }
+                                if (parent) {
+                                    parent.classList.add('embedding-popup-container');
+                                } else if (attempts < 50) {
+                                    attempts++;
+                                    window.requestAnimationFrame(checkParent);
+                                }
+                            };
+                            checkParent();
+
+                            return { 
+                                dom
                             }; 
                         }
                     })
@@ -237,7 +247,7 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
                 removeTooltip();
 
                 const dom = buildSimilarTooltip(app, results, 'Similar Snippets');
-                dom.classList.add('read-mode-tooltip');
+                dom.classList.add('read-mode-tooltip', 'embedding-popup-container');
                 dom.style.position = 'absolute';
                 dom.style.left = `${rect.left}px`;
                 dom.style.top = `${rect.bottom + window.scrollY + 10}px`;

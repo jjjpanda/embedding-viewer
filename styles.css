@@ -33,22 +33,37 @@
     border-left: 3px solid rgba(237, 100, 100, 0.4);
 }
 
-.cm-tooltip.embedding-cm-tooltip {
-    background-color: transparent !important;
-    border: none !important;
-    box-shadow: none !important;
-    padding: 0 !important;
+.theme-dark .embedding-popup-container {
+    background-color: var(--background-primary, #1e1e1e) !important;
+}
+
+.theme-light .embedding-popup-container {
+    background-color: var(--background-primary, #ffffff) !important;
+}
+
+.embedding-popup-container {
+    border: 1px solid var(--background-modifier-border) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2) !important;
+    color: var(--text-normal) !important;
     z-index: 1000 !important;
+}
+
+.cm-tooltip.embedding-popup-container {
+    padding: 0 !important; /* Let the inner element handle padding */
+}
+
+.theme-dark .embedding-hover-tooltip {
+    background-color: var(--background-primary, #1e1e1e) !important;
+}
+
+.theme-light .embedding-hover-tooltip {
+    background-color: var(--background-primary, #ffffff) !important;
 }
 
 .embedding-hover-tooltip {
     padding: 10px;
     max-width: 350px;
-    background-color: var(--background-primary);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: 8px;
-    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
-    z-index: 1000;
     cursor: default;
     color: var(--text-normal);
 }

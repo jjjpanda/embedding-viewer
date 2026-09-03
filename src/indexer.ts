@@ -1,6 +1,7 @@
 import { App, TFile, Notice } from 'obsidian';
 import { DatabaseManager } from './db';
 import EmbeddingViewerPlugin from './main';
+import { Transaction } from '@electric-sql/pglite';
 
 export interface Chunk {
     embedText: string;
@@ -361,8 +362,12 @@ export class Indexer {
             }
 
             try {
-                await db.query(`DROP INDEX IF EXISTS embeddings_hnsw_idx`);
-                await db.query(`ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dimension})`);
+                const { rows: typeRows } = await db.query(`SELECT format_type(atttypid, atttypmod) as type FROM pg_attribute WHERE attrelid = 'embeddings'::regclass AND attname = 'embedding'`);
+                const currentType = (typeRows[0] as any)?.type;
+                if (currentType !== `vector(${dimension})`) {
+                    await db.query(`DROP INDEX IF EXISTS embeddings_hnsw_idx`);
+                    await db.query(`ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dimension})`);
+                }
                 this.schemaVerified = true;
             } catch (e) {
                 console.log("Could not alter table dimension:", e);
@@ -386,7 +391,7 @@ export class Indexer {
 
             const currentPaths = new Set(files.map(f => f.path));
             for (const [p] of indexedMtimes) {
-                if (!currentPaths.has(p)) {
+                if (!currentPaths.has(p as string)) {
                     await db.query('DELETE FROM embeddings WHERE path = $1', [p]);
                     await db.query('DELETE FROM file_registry WHERE path = $1', [p]);
                 }
@@ -397,7 +402,7 @@ export class Indexer {
             const toIndex = files.filter(f => {
                 const mtime = Math.floor(f.stat.mtime);
                 const storedRaw = indexedMtimes.get(f.path);
-                const stored = storedRaw === undefined ? undefined : Math.floor(storedRaw);
+                const stored = storedRaw === undefined ? undefined : Math.floor(storedRaw as number);
                 const outOfDate = stored === undefined || mtime > stored;
                 if (outOfDate) {
                     console.log(`[Embedding Viewer] Rebuild found stale file: ${f.path} (File mtime: ${mtime} > DB stored: ${stored})`);
@@ -441,8 +446,22 @@ export class Indexer {
                 }
             }
 
+            // Optimize Postgres for bulk updates
+            await db.exec(`
+                SET synchronous_commit = off;
+                SET maintenance_work_mem = '256MB';
+            `);
+
+            // Only drop the index if we are doing a massive insert (e.g. initial index or >500 files)
+            // Incremental inserts are much faster than rebuilding HNSW for the whole table.
+            const isBulkUpdate = toIndex.length > 500 || force;
+            if (isBulkUpdate) {
+                updateProgress('Temporarily dropping index for bulk update...');
+                await db.exec('DROP INDEX IF EXISTS embeddings_hnsw_idx');
+            }
+
             // Perform DB registry updates in batches to avoid WASM bridge overhead
-            await db.transaction(async (tx) => {
+            await db.transaction(async (tx: Transaction) => {
                 updateProgress('Clearing old embeddings...');
                 const allPaths = toIndex.map(f => (f).path);
                 
@@ -483,7 +502,7 @@ export class Indexer {
                 updateProgress(`Committing registry updates...`);
             });
 
-            const BATCH_SIZE = this.plugin.settings.batchSize ?? 50;
+            const BATCH_SIZE = Math.max(1, this.plugin.settings.batchSize || 50);
             totalChunks = allChunks.length;
             
             let previousDbTask: Promise<void> | null = null;
@@ -512,7 +531,7 @@ export class Indexer {
                     let queryParams = [];
                     let paramIdx = 1;
 
-                    await db.transaction(async (tx) => {
+                    await db.transaction(async (tx: Transaction) => {
                         for (let j = 0; j < batch.length; j++) {
                             const item = batch[j];
                             const emb = embeddings[j];
@@ -543,19 +562,21 @@ export class Indexer {
                 })();
             }
             if (previousDbTask) {
-                // Final DB write — no fetch to overlap with, so this blocks visibly
+                // Final DB write 
                 updateProgress(`Writing final embeddings...`);
                 await previousDbTask;
             }
 
             updateProgress(`Finalizing index...`);
-            // HNSW build is O(n log n) in WASM — can take minutes for large vaults
+            
+            // HNSW build runs in the Web Worker, keeping the UI fully responsive
             if (dimension <= 2000) {
                 await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
             } else if (dimension <= 4000) {
                 await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw ((embedding::halfvec(${dimension})) halfvec_cosine_ops)`);
             }
             await this.dbManager.saveDb();
+            await db.exec('SET synchronous_commit = on;');
             
             new Notice(`Indexed ${totalChunks} chunks from ${toIndex.length} files.`);
             updateProgress(`Indexed ${toIndex.length} files.`);
@@ -566,6 +587,10 @@ export class Indexer {
             new Notice('Error during index rebuild. See console.');
             updateProgress('Error during index rebuild.');
             window.setTimeout(() => updateProgress(null), 3000);
+            try {
+                const db = await this.dbManager.getDb();
+                if (db) await db.exec('SET synchronous_commit = on;');
+            } catch (e) {}
         }
     }
 
@@ -595,6 +620,7 @@ export class Indexer {
 
     private async processQueue() {
         if (this.isProcessingQueue) return;
+
         this.isProcessingQueue = true;
 
         const db = await this.dbManager.getDb();
@@ -609,8 +635,12 @@ export class Indexer {
             dimension = probeResult[0]?.length || 0;
             if (dimension > 0 && !this.schemaVerified) {
                 try {
-                    await db.query(`DROP INDEX IF EXISTS embeddings_hnsw_idx`);
-                    await db.query(`ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dimension})`);
+                    const { rows: typeRows } = await db.query(`SELECT format_type(atttypid, atttypmod) as type FROM pg_attribute WHERE attrelid = 'embeddings'::regclass AND attname = 'embedding'`);
+                    const currentType = (typeRows[0] as any)?.type;
+                    if (currentType !== `vector(${dimension})`) {
+                        await db.query(`DROP INDEX IF EXISTS embeddings_hnsw_idx`);
+                        await db.query(`ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dimension})`);
+                    }
                     if (dimension <= 2000) {
                         await db.exec(`CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_cosine_ops)`);
                     } else if (dimension <= 4000) {
@@ -629,11 +659,28 @@ export class Indexer {
             return;
         }
 
+        let processedCount = 0;
+        let cacheHitCount = 0;
+        let cacheMissCount = 0;
+        let mtimeDriftCount = 0;
+
         while (this.fileIndexQueue.length > 0) {
+            if (this.fileIndexQueue.length > (this.plugin.settings.bulkIndexThreshold || 20)) {
+                this.fileIndexQueue = [];
+                this.isProcessingQueue = false;
+                if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
+                this.rebuildIndex((msg) => {
+                    if (this.plugin.statusBarItem) {
+                        this.plugin.statusBarItem.setText(msg === null ? '' : `🧠 ${msg}`);
+                    }
+                });
+                return;
+            }
+
             const file = this.fileIndexQueue.shift();
             if (!file) continue;
 
-            console.debug(`[Embedding Viewer] processQueue dequeued file: ${file.path}`);
+            processedCount++;
 
             try {
 
@@ -644,16 +691,16 @@ export class Indexer {
             if (rows.length > 0) {
                 const reg = rows[0] as any;
                 if (reg.hash === contentHash && reg.chunk_size === this.maxChunkSize && reg.prefix === this.prefix) {
-                    console.debug(`[Embedding Viewer] Cache hit for ${file.path} (hash: ${contentHash}). Skipping full index.`);
+                    cacheHitCount++;
                     if (Math.floor(Number(reg.mtime)) !== Math.floor(file.stat.mtime)) {
-                        console.debug(`[Embedding Viewer] Cache mtime drift detected for ${file.path} (DB: ${reg.mtime} vs File: ${file.stat.mtime}). Updating mtime.`);
+                        mtimeDriftCount++;
                         await db.query('UPDATE file_registry SET mtime = $1 WHERE path = $2', [Math.floor(file.stat.mtime), file.path]);
                     }
                     continue;
                 }
-                console.debug(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Hash changed (${reg.hash} -> ${contentHash}) or settings changed.`);
+                cacheMissCount++;
             } else {
-                console.debug(`[Embedding Viewer] Cache miss for ${file.path}. Reason: Not in registry.`);
+                cacheMissCount++;
             }
 
             if (this.plugin.statusBarItem) {
@@ -675,7 +722,7 @@ export class Indexer {
 
             if (chunks.length === 0) continue;
 
-            const BATCH_SIZE = this.plugin.settings.batchSize ?? 50;
+            const BATCH_SIZE = Math.max(1, this.plugin.settings.batchSize || 50);
             let previousDbTask: Promise<void> | null = null;
 
             // Same pipeline as rebuildIndex — overlap fetch[N] with dbInsert[N-1]
@@ -699,7 +746,7 @@ export class Indexer {
                     let queryParams = [];
                     let paramIdx = 1;
                     
-                    await db.transaction(async (tx) => {
+                    await db.transaction(async (tx: Transaction) => {
                         for (let j = 0; j < batch.length; j++) {
                             const p = batch[j] as Chunk;
                             const emb = embeddings[j];
@@ -739,6 +786,11 @@ export class Indexer {
             console.error(`Error indexing file ${file.path}:`, err);
         }
         } // End of while loop
+        
+        if (processedCount > 0) {
+            console.debug(`[Embedding Viewer] Queue processing complete. Processed: ${processedCount}, Cache hits: ${cacheHitCount}, Cache misses: ${cacheMissCount}, Mtime drifts: ${mtimeDriftCount}`);
+        }
+
         this.isProcessingQueue = false;
         
         if (this.plugin.statusBarItem) {
