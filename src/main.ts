@@ -1,4 +1,4 @@
-import { Plugin, Notice, MarkdownView, WorkspaceLeaf, Menu } from 'obsidian';
+import { Plugin, Notice, MarkdownView, WorkspaceLeaf, Menu, TFile, setIcon } from 'obsidian';
 import { DatabaseManager } from './db';
 import { Indexer } from './indexer';
 import { QueryService } from './query';
@@ -19,6 +19,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
     visualizerActive: boolean = false;
     onLaunchProcess: ChildProcess | null = null;
     statusBarItem!: HTMLElement;
+    fileStatusItem!: HTMLElement;
 
     async onload() {
         await this.loadSettings();
@@ -48,11 +49,9 @@ export default class EmbeddingViewerPlugin extends Plugin {
         this.registerDomEvent(window, 'beforeunload', () => this.cleanupProcess());
 
         this.dbManager = new DatabaseManager(this);
-        
-        // Wait for DB to be ready
-        await this.dbManager.getDb();
-
         this.queryService = new QueryService(this.dbManager, this);
+
+
         this.indexer = new Indexer(
             this.app,
             this.dbManager,
@@ -81,7 +80,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             }
             indexDebouncers.set(file.path, window.setTimeout(() => {
                 indexDebouncers.delete(file.path);
-                this.indexer.indexFile(file);
+                this.indexer.queueFileForIndex(file);
             }, this.settings.debounceTime || 15000));
         };
         
@@ -123,10 +122,16 @@ export default class EmbeddingViewerPlugin extends Plugin {
         this.registerEvent(this.app.vault.on('modify', (file) => {
             scheduleLog('modify', file.path);
             scheduleIndex(file, 'modify');
+            this.updateFileExplorer();
+            const activeFile = this.app.workspace.getActiveFile();
+            if (activeFile && activeFile.path === file.path) {
+                this.updateFileStatus(activeFile);
+            }
         }));
         this.registerEvent(this.app.vault.on('create', (file) => {
             scheduleLog('create', file.path);
             scheduleIndex(file, 'create');
+            this.updateFileExplorer();
         }));
         
         this.registerEvent(this.app.vault.on('delete', (file) => {
@@ -137,6 +142,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
                     indexDebouncers.delete(file.path);
                 }
                 this.indexer.deleteFile(file.path);
+                this.updateFileExplorer();
             }
         }));
         
@@ -145,6 +151,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
                 scheduleLog('rename', `${oldPath} -> ${file.path}`);
                 this.indexer.deleteFile(oldPath);
                 scheduleIndex(file, 'rename');
+                this.updateFileExplorer();
             }
         }));
 
@@ -173,6 +180,42 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
         this.statusBarItem = this.addStatusBarItem();
         this.statusBarItem.setText('');
+
+        this.fileStatusItem = this.addStatusBarItem();
+        this.fileStatusItem.setText('🧠 Booting DB...');
+        
+        this.registerEvent(
+            this.app.workspace.on('file-open', (file) => {
+                this.updateFileStatus(file);
+            })
+        );
+        this.registerEvent(
+            this.app.workspace.on('active-leaf-change', () => {
+                window.setTimeout(() => {
+                    this.updateFileStatus(this.app.workspace.getActiveFile());
+                }, 50);
+            })
+        );
+        this.registerEvent(
+            this.app.workspace.on('layout-change', () => {
+                this.updateFileExplorer();
+            })
+        );
+        
+        // Load DB in background and update UI once ready
+        this.dbManager.loadDb().then(() => {
+            if (this.app.workspace.layoutReady) {
+                const activeFile = this.app.workspace.getActiveFile();
+                this.updateFileStatus(activeFile);
+                this.updateFileExplorer();
+            } else {
+                this.app.workspace.onLayoutReady(() => {
+                    const activeFile = this.app.workspace.getActiveFile();
+                    this.updateFileStatus(activeFile);
+                    this.updateFileExplorer();
+                });
+            }
+        });
 
         this.addCommand({
             id: 'toggle-chunk-visualizer',
@@ -266,6 +309,101 @@ export default class EmbeddingViewerPlugin extends Plugin {
             })
         );
 
+    }
+
+    private updateFileExplorerTimeout: number | null = null;
+    
+    async updateFileExplorer() {
+        if (this.updateFileExplorerTimeout !== null) {
+            window.clearTimeout(this.updateFileExplorerTimeout);
+        }
+        
+        this.updateFileExplorerTimeout = window.setTimeout(async () => {
+            const indexedPaths = new Map<string, number>();
+            const registry = this.dbManager.state.registry;
+            for (const p in registry) {
+                indexedPaths.set(p, registry[p]!.mtime);
+            }
+
+            const fileExplorerLeaves = this.app.workspace.getLeavesOfType('file-explorer');
+            for (const leaf of fileExplorerLeaves) {
+                const fileItems = (leaf.view as any).fileItems;
+                if (!fileItems) continue;
+                
+                let lastYield = performance.now();
+                for (const path in fileItems) {
+                    const item = fileItems[path];
+                    const file = item.file;
+                    if (!file || file.extension !== 'md') continue;
+                    
+                    const isIndexed = indexedPaths.has(file.path);
+                    let desiredClass = '';
+                    if (isIndexed) {
+                        const regTime = indexedPaths.get(file.path)!;
+                        const fileTime = Math.floor(file.stat.mtime);
+                        if (regTime === fileTime) {
+                            desiredClass = 'embedding-indexed';
+                        } else {
+                            desiredClass = 'embedding-pending';
+                        }
+                    }
+                    
+                    if (item.titleEl) {
+                        const existing = item.titleEl.querySelector('.embedding-indicator');
+                        if (existing) {
+                            if (!desiredClass) {
+                                existing.remove();
+                            } else if (!existing.classList.contains(desiredClass)) {
+                                existing.className = 'embedding-indicator ' + desiredClass;
+                                existing.setAttribute('aria-label', desiredClass === 'embedding-indexed' ? 'Indexed' : 'Pending update');
+                            }
+                        } else if (desiredClass) {
+                            const el = document.createElement('span');
+                            el.className = 'embedding-indicator ' + desiredClass;
+                            el.setAttribute('aria-label', desiredClass === 'embedding-indexed' ? 'Indexed' : 'Pending update');
+                            item.titleEl.appendChild(el);
+                        }
+                    }
+                    
+                    if (performance.now() - lastYield > 16) {
+                        await new Promise(r => window.setTimeout(r, 0));
+                        lastYield = performance.now();
+                    }
+                }
+            }
+        }, 500);
+    }
+
+    async updateFileStatus(file: TFile | null) {
+        let targetFile = file;
+        if (!targetFile) {
+            targetFile = this.app.workspace.getActiveViewOfType(MarkdownView)?.file || null;
+        }
+
+        if (!targetFile || targetFile.extension !== 'md') {
+            if (this.fileStatusItem) this.fileStatusItem.setText('');
+            return;
+        }
+
+        try {
+            const reg = this.dbManager.state.registry[targetFile.path];
+            
+            if (reg) {
+                if (Math.floor(Number(reg.mtime)) === Math.floor(targetFile.stat.mtime)) {
+                    this.fileStatusItem.setText('🧠 Indexed');
+                    this.fileStatusItem.setAttribute('aria-label', 'This file is in the embedding index and up to date');
+                } else {
+                    this.fileStatusItem.setText('🧠 Pending Update');
+                    this.fileStatusItem.setAttribute('aria-label', 'This file has changes waiting to be indexed');
+                }
+            } else {
+                this.fileStatusItem.setText('🧠 Unindexed');
+                this.fileStatusItem.setAttribute('aria-label', 'This file is not indexed');
+            }
+        } catch (error) {
+            console.error('[Embedding Viewer] updateFileStatus error:', error);
+            this.fileStatusItem.setText('🧠 DB Error');
+        }
     }
 
     async activateView() {
