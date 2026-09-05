@@ -198,6 +198,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
         );
         this.registerEvent(
             this.app.workspace.on('layout-change', () => {
+                this.attachFileExplorerObservers();
                 this.updateFileExplorer();
             })
         );
@@ -207,11 +208,13 @@ export default class EmbeddingViewerPlugin extends Plugin {
             if (this.app.workspace.layoutReady) {
                 const activeFile = this.app.workspace.getActiveFile();
                 this.updateFileStatus(activeFile);
+                this.attachFileExplorerObservers();
                 this.updateFileExplorer();
             } else {
                 this.app.workspace.onLayoutReady(() => {
                     const activeFile = this.app.workspace.getActiveFile();
                     this.updateFileStatus(activeFile);
+                    this.attachFileExplorerObservers();
                     this.updateFileExplorer();
                 });
             }
@@ -311,14 +314,31 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
     }
 
+    private fileExplorerObservers: MutationObserver[] = [];
     private updateFileExplorerTimeout: number | null = null;
+
+    attachFileExplorerObservers() {
+        for (const obs of this.fileExplorerObservers) {
+            obs.disconnect();
+        }
+        this.fileExplorerObservers = [];
+
+        const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+        for (const leaf of leaves) {
+            const container = (leaf.view as any)?.containerEl;
+            if (!container) continue;
+            const obs = new MutationObserver(() => this.updateFileExplorer());
+            obs.observe(container, { childList: true, subtree: true });
+            this.fileExplorerObservers.push(obs);
+        }
+    }
     
-    async updateFileExplorer() {
+    updateFileExplorer() {
         if (this.updateFileExplorerTimeout !== null) {
             window.clearTimeout(this.updateFileExplorerTimeout);
         }
         
-        this.updateFileExplorerTimeout = window.setTimeout(async () => {
+        this.updateFileExplorerTimeout = window.setTimeout(() => {
             const indexedPaths = new Map<string, number>();
             const registry = this.dbManager.state.registry;
             for (const p in registry) {
@@ -327,51 +347,52 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
             const fileExplorerLeaves = this.app.workspace.getLeavesOfType('file-explorer');
             for (const leaf of fileExplorerLeaves) {
-                const fileItems = (leaf.view as any).fileItems;
+                const fileItems = (leaf.view as any)?.fileItems;
                 if (!fileItems) continue;
                 
-                let lastYield = performance.now();
                 for (const path in fileItems) {
                     const item = fileItems[path];
-                    const file = item.file;
+                    const file = item?.file;
                     if (!file || file.extension !== 'md') continue;
                     
+                    const el = (item.selfEl || item.innerEl || item.titleEl || item.el) as HTMLElement | undefined;
+                    if (!el) continue;
+
+                    // Clean up any legacy injected span elements
+                    const legacySpan = el.querySelector?.('.embedding-indicator');
+                    if (legacySpan) legacySpan.remove();
+
                     const isIndexed = indexedPaths.has(file.path);
-                    let desiredClass = '';
+                    let shouldBePending = false;
+                    let shouldBeUnindexed = false;
+
                     if (isIndexed) {
                         const regTime = indexedPaths.get(file.path)!;
                         const fileTime = Math.floor(file.stat.mtime);
-                        if (regTime === fileTime) {
-                            desiredClass = 'embedding-indexed';
-                        } else {
-                            desiredClass = 'embedding-pending';
+                        if (regTime !== fileTime) {
+                            shouldBePending = true;
                         }
+                    } else {
+                        shouldBeUnindexed = true;
                     }
-                    
-                    if (item.titleEl) {
-                        const existing = item.titleEl.querySelector('.embedding-indicator');
-                        if (existing) {
-                            if (!desiredClass) {
-                                existing.remove();
-                            } else if (!existing.classList.contains(desiredClass)) {
-                                existing.className = 'embedding-indicator ' + desiredClass;
-                                existing.setAttribute('aria-label', desiredClass === 'embedding-indexed' ? 'Indexed' : 'Pending update');
-                            }
-                        } else if (desiredClass) {
-                            const el = document.createElement('span');
-                            el.className = 'embedding-indicator ' + desiredClass;
-                            el.setAttribute('aria-label', desiredClass === 'embedding-indexed' ? 'Indexed' : 'Pending update');
-                            item.titleEl.appendChild(el);
-                        }
-                    }
-                    
-                    if (performance.now() - lastYield > 16) {
-                        await new Promise(r => window.setTimeout(r, 0));
-                        lastYield = performance.now();
+
+                    if (shouldBePending) {
+                        if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
+                        if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                        if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                    } else if (shouldBeUnindexed) {
+                        if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
+                        if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                        if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                    } else {
+                        // Indexed and up to date -> no color/badge
+                        if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                        if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
                     }
                 }
             }
-        }, 500);
+        }, 100);
     }
 
     async updateFileStatus(file: TFile | null) {
@@ -447,6 +468,24 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
     async onunload() {
         this.cleanupProcess();
+        for (const obs of this.fileExplorerObservers) {
+            obs.disconnect();
+        }
+        this.fileExplorerObservers = [];
+
+        // Remove indicator classes from explorer
+        const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+        for (const leaf of leaves) {
+            const fileItems = (leaf.view as any)?.fileItems;
+            if (!fileItems) continue;
+            for (const path in fileItems) {
+                const el = (fileItems[path]?.selfEl || fileItems[path]?.el) as HTMLElement | undefined;
+                if (el) {
+                    el.classList.remove('embedding-indexed', 'embedding-pending', 'embedding-unindexed');
+                }
+            }
+        }
+
         if (this.api) {
             this.api.stop();
         }
