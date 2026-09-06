@@ -1,4 +1,6 @@
 import { Notice } from 'obsidian';
+import * as fs from 'fs';
+import * as path from 'path';
 import EmbeddingViewerPlugin from './main';
 
 export interface ChunkRecord {
@@ -68,20 +70,13 @@ export class DatabaseManager {
 
     private async readBinaryFast(relPath: string): Promise<Uint8Array> {
         try {
-            // @ts-ignore
-            if (typeof require !== 'undefined') {
-                // @ts-ignore
-                const fs = require('fs');
-                // @ts-ignore
-                const path = require('path');
-                const adapter = this.plugin.app.vault.adapter;
-                if ('getBasePath' in adapter && typeof (adapter as any).getBasePath === 'function') {
-                    const basePath = (adapter as any).getBasePath();
-                    const fullPath = path.join(basePath, relPath);
-                    if (fs.existsSync(fullPath)) {
-                        const buffer = await fs.promises.readFile(fullPath);
-                        return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-                    }
+            const adapter = this.plugin.app.vault.adapter;
+            if ('getBasePath' in adapter && typeof (adapter as any).getBasePath === 'function') {
+                const basePath = (adapter as any).getBasePath();
+                const fullPath = path.join(basePath, relPath);
+                if (fs.existsSync(fullPath)) {
+                    const buffer = await fs.promises.readFile(fullPath);
+                    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
                 }
             }
         } catch (e) {
@@ -302,29 +297,22 @@ export class DatabaseManager {
             const writeBinaryFast = async (relPath: string, data: Uint8Array) => {
                 let written = false;
                 try {
-                    // @ts-ignore
-                    if (typeof require !== 'undefined') {
-                        // @ts-ignore
-                        const fs = require('fs');
-                        // @ts-ignore
-                        const path = require('path');
-                        const adapter = this.plugin.app.vault.adapter;
-                        if ('getBasePath' in adapter && typeof (adapter as any).getBasePath === 'function') {
-                            const basePath = (adapter as any).getBasePath();
-                            const fullPath = path.join(basePath, relPath);
-                            const tmpPath = fullPath + '.tmp';
-                            await fs.promises.writeFile(tmpPath, data);
-                            try {
-                                if (fs.existsSync(fullPath)) {
-                                    await fs.promises.unlink(fullPath);
-                                }
-                            } catch (unlinkErr) {
-                                // ignore
+                    const adapter = this.plugin.app.vault.adapter;
+                    if ('getBasePath' in adapter && typeof (adapter as any).getBasePath === 'function') {
+                        const basePath = (adapter as any).getBasePath();
+                        const fullPath = path.join(basePath, relPath);
+                        const tmpPath = fullPath + '.tmp';
+                        await fs.promises.writeFile(tmpPath, data);
+                        try {
+                            if (fs.existsSync(fullPath)) {
+                                await fs.promises.unlink(fullPath);
                             }
-                            await fs.promises.rename(tmpPath, fullPath);
-                            written = true;
-                            return;
+                        } catch (unlinkErr) {
+                            // ignore
                         }
+                        await fs.promises.rename(tmpPath, fullPath);
+                        written = true;
+                        return;
                     }
                 } catch (e) {
                     console.warn("Direct fs write failed, falling back to adapter", e);
@@ -340,7 +328,7 @@ export class DatabaseManager {
 
             // Write files asynchronously
             await writeBinaryFast(this.jsonlPath, finalJsonBuffer);
-            await writeBinaryFast(this.binPath, new Uint8Array(bin.buffer as unknown as ArrayBuffer, bin.byteOffset, bin.byteLength));
+            await writeBinaryFast(this.binPath, new Uint8Array(bin.buffer, bin.byteOffset, bin.byteLength));
             
             // Cleanup legacy JSON file if it exists
             if (await this.plugin.app.vault.adapter.exists(this.dbPath)) {
