@@ -1,4 +1,4 @@
-import { DatabaseManager } from './db';
+import { DatabaseManager, ChunkRecord } from './db';
 import EmbeddingViewerPlugin from './main';
 
 export interface QueryResult {
@@ -23,32 +23,25 @@ export class QueryService {
     constructor(private dbManager: DatabaseManager, private plugin: EmbeddingViewerPlugin) {}
 
     async findSimilarPerChunk(filePath: string, topKPerChunk: number = 3, maxChunks: number = 8): Promise<ChunkMatchGroup[]> {
-        const db = await this.dbManager.getDb();
-        if (!db) return [];
-
+        await this.dbManager.waitForLoad();
         try {
-            const { rows: sourceRows } = await db.query(
-                `SELECT content, embedding, metadata->>'heading' AS heading FROM embeddings WHERE path = $1 ORDER BY id ASC`,
-                [filePath]
-            );
+            const sourceRows = this.dbManager.state.chunks.filter(c => c.path === filePath);
             if (sourceRows.length === 0) return [];
 
             let selectedRows = sourceRows;
             if (sourceRows.length > maxChunks) {
-                selectedRows = [...sourceRows].sort((a: any, b: any) => b.content.length - a.content.length).slice(0, maxChunks);
+                selectedRows = [...sourceRows].sort((a, b) => b.content.length - a.content.length).slice(0, maxChunks);
             }
 
-            // Fetch sequentially to avoid overwhelming PGLite WASM
             const FETCH_K = 10;
             const resultsArrays = [];
-            for (const r of selectedRows as any[]) {
-                const vec = typeof r.embedding === 'string' ? JSON.parse(r.embedding) : r.embedding;
-                const matches = await this.findSimilarForVector(vec, filePath, FETCH_K);
-                resultsArrays.push(matches.map(m => ({ sourceContent: String(r.content), sourceHeading: r.heading || null, match: m })));
+            for (const r of selectedRows) {
+                if (!r.vector) continue;
+                const matches = await this.findSimilarForVector(Array.from(r.vector), filePath, FETCH_K);
+                resultsArrays.push(matches.map(m => ({ sourceContent: r.content, sourceHeading: r.metadata.heading || null, match: m })));
             }
             const allCandidates = resultsArrays.flat();
 
-            // Sort all candidates globally by similarity descending
             allCandidates.sort((a, b) => b.match.similarity - a.match.similarity);
 
             const usedPaths = new Set<string>();
@@ -80,7 +73,6 @@ export class QueryService {
                 results.push({ sourceContent, sourceHeading: data.heading, matches: data.matches });
             }
 
-            // Sort chunks by their best match's similarity score
             results.sort((a, b) => (b.matches[0]?.similarity || 0) - (a.matches[0]?.similarity || 0));
 
             return results;
@@ -90,71 +82,68 @@ export class QueryService {
         }
     }
 
-
-
-    /**
-     * Finds similar chunks for a given raw embedding vector.
-     */
     async findSimilarForVector(vector: number[], excludePath?: string, topK: number = 5): Promise<QueryResult[]> {
-        const db = await this.dbManager.getDb();
-        if (!db) return [];
-
+        await this.dbManager.waitForLoad();
         try {
             const nowMs = Date.now();
             const msPerMonth = 1000 * 60 * 60 * 24 * 30;
-
-            const vectorStr = `[${vector.join(',')}]`;
             const maxSim = this.plugin.settings.maximumSimilarity ?? 0.95;
-
-            let queryStr = `
-                SELECT path, content, metadata->>'heading' AS heading, (metadata->>'startLine')::int AS "startLine", (metadata->>'endLine')::int AS "endLine", mtime,
-                (1 - (embedding <=> $1::vector)) as "rawSimilarity"
-                FROM embeddings
-                ORDER BY embedding <=> $1::vector LIMIT 300
-            `;
-            const params: any[] = [vectorStr];
-
-            const { rows } = await db.query(queryStr, params);
 
             let linkedPaths = new Set<string>();
             if (excludePath) {
                 const resolvedLinks = this.plugin.app.metadataCache.resolvedLinks || {};
-                const outlinks = resolvedLinks[excludePath] || {};
+                const outlinks = (resolvedLinks as any)[excludePath] || {};
                 linkedPaths = new Set<string>(Object.keys(outlinks));
                 for (const [src, tgts] of Object.entries(resolvedLinks)) {
-                    if (tgts[excludePath]) linkedPaths.add(src);
+                    if ((tgts as any)[excludePath]) linkedPaths.add(src);
                 }
             }
 
-            const seenPaths = new Set<string>();
-            const results: QueryResult[] = [];
-            for (const row of rows as any[]) {
-                if (excludePath && row.path === excludePath) continue;
-                if (seenPaths.has(row.path)) continue;
-                if (row.rawSimilarity >= maxSim) continue; // Filter out exact matches/duplicates
-                
-                seenPaths.add(row.path);
+            const queryVector = vector instanceof Float32Array ? vector : new Float32Array(vector);
+            
+            const scored: QueryResult[] = [];
+            for (const chunk of this.dbManager.state.chunks) {
+                if (excludePath && chunk.path === excludePath) continue;
+                if (!chunk.vector) continue;
 
-                const timePenalty = (((nowMs - row.mtime) / msPerMonth) * (this.plugin.settings.penaltyPerMonth / 100.0));
-                const linkPenalty = linkedPaths.has(row.path) ? 0.30 : 0;
-                const similarity = row.rawSimilarity - timePenalty - linkPenalty;
+                // compute cosine similarity
+                const rawSimilarity = this.dbManager.cosineSimilarity(queryVector, chunk.vector);
+                
+                if (rawSimilarity >= maxSim) continue;
+
+                const timePenalty = (((nowMs - chunk.mtime) / msPerMonth) * (this.plugin.settings.penaltyPerMonth / 100.0));
+                const linkPenalty = linkedPaths.has(chunk.path) ? 0.30 : 0;
+                const similarity = rawSimilarity - timePenalty - linkPenalty;
                 
                 if (similarity >= this.plugin.settings.minimumSimilarity) {
-                    results.push({
-                        path: row.path,
-                        content: row.content,
-                        heading: row.heading,
-                        startLine: row.startLine,
-                        endLine: row.endLine,
+                    scored.push({
+                        path: chunk.path,
+                        content: chunk.content,
+                        heading: chunk.metadata.heading || null,
+                        startLine: chunk.metadata.startLine || 0,
+                        endLine: chunk.metadata.endLine || 0,
                         similarity,
-                        rawSimilarity: row.rawSimilarity,
+                        rawSimilarity,
                         timePenalty,
                         linkPenalty
                     });
                 }
             }
-            results.sort((a, b) => b.similarity - a.similarity);
-            return results.slice(0, topK);
+            
+            // Sort by similarity descending
+            scored.sort((a, b) => b.similarity - a.similarity);
+            
+            // Deduplicate by path
+            const seenPaths = new Set<string>();
+            const results: QueryResult[] = [];
+            for (const item of scored) {
+                if (seenPaths.has(item.path)) continue;
+                seenPaths.add(item.path);
+                results.push(item);
+                if (results.length >= topK) break;
+            }
+            
+            return results;
         } catch (err) {
             console.error('Query failed:', err);
             return [];

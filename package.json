@@ -1,7 +1,7 @@
 {
 	"name": "obsidian-sample-plugin",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Semantic search and visualization tool using local embeddings",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
@@ -26,9 +26,5 @@
 		"obsidian": "latest",
 		"typescript": "^5.8.3",
 		"typescript-eslint": "^8.59.1"
-	},
-	"dependencies": {
-		"@electric-sql/pglite": "^0.5.7",
-		"@electric-sql/pglite-pgvector": "^0.0.8"
 	}
 }

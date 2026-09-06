@@ -1,4 +1,4 @@
-import { Plugin, Notice, MarkdownView, WorkspaceLeaf, Menu } from 'obsidian';
+import { Plugin, Notice, MarkdownView, WorkspaceLeaf, Menu, TFile, TFolder, setIcon } from 'obsidian';
 import { DatabaseManager } from './db';
 import { Indexer } from './indexer';
 import { QueryService } from './query';
@@ -19,6 +19,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
     visualizerActive: boolean = false;
     onLaunchProcess: ChildProcess | null = null;
     statusBarItem!: HTMLElement;
+    fileStatusItem!: HTMLElement;
 
     async onload() {
         await this.loadSettings();
@@ -47,12 +48,10 @@ export default class EmbeddingViewerPlugin extends Plugin {
         
         this.registerDomEvent(window, 'beforeunload', () => this.cleanupProcess());
 
-        this.dbManager = new DatabaseManager(this.app);
-        
-        // Wait for DB to be ready
-        await this.dbManager.getDb();
-
+        this.dbManager = new DatabaseManager(this);
         this.queryService = new QueryService(this.dbManager, this);
+
+
         this.indexer = new Indexer(
             this.app,
             this.dbManager,
@@ -63,41 +62,89 @@ export default class EmbeddingViewerPlugin extends Plugin {
         
         const scheduleIndex = (file: any, eventName: string) => {
             if (file.extension !== 'md') return;
-            if (indexDebouncers.has(file.path)) {
-                clearTimeout(indexDebouncers.get(file.path)!);
+
+            if (this.isFileExcluded(file)) {
+                this.indexer.deleteFile(file.path);
+                return;
             }
-            indexDebouncers.set(file.path, setTimeout(() => {
+
+            if (indexDebouncers.has(file.path)) {
+                window.clearTimeout(indexDebouncers.get(file.path));
+            }
+            indexDebouncers.set(file.path, window.setTimeout(() => {
                 indexDebouncers.delete(file.path);
-                console.log(`[Embedding Viewer] Queueing file for indexing (Event-driven: ${eventName}):`, file.path);
-                this.indexer.indexFile(file);
+                this.indexer.queueFileForIndex(file);
             }, this.settings.debounceTime || 15000));
         };
         
+        const eventBatches = {
+            create: new Set<string>(),
+            modify: new Set<string>(),
+            delete: new Set<string>(),
+            rename: new Set<string>()
+        };
+        let batchLogTimeout: any = null;
+
+        const logBatch = () => {
+            if (eventBatches.create.size > 0) {
+                console.log(`[Embedding Viewer] Files created (${eventBatches.create.size}):`, Array.from(eventBatches.create));
+                eventBatches.create.clear();
+            }
+            if (eventBatches.modify.size > 0) {
+                console.log(`[Embedding Viewer] Files modified (${eventBatches.modify.size}):`, Array.from(eventBatches.modify));
+                eventBatches.modify.clear();
+            }
+            if (eventBatches.delete.size > 0) {
+                console.log(`[Embedding Viewer] Files deleted (${eventBatches.delete.size}):`, Array.from(eventBatches.delete));
+                eventBatches.delete.clear();
+            }
+            if (eventBatches.rename.size > 0) {
+                console.log(`[Embedding Viewer] Files renamed (${eventBatches.rename.size}):`, Array.from(eventBatches.rename));
+                eventBatches.rename.clear();
+            }
+            batchLogTimeout = null;
+        };
+
+        const scheduleLog = (type: keyof typeof eventBatches, msg: string) => {
+            eventBatches[type].add(msg);
+            if (!batchLogTimeout) {
+                batchLogTimeout = window.setTimeout(logBatch, 2000);
+            }
+        };
+
         this.registerEvent(this.app.vault.on('modify', (file) => {
-            console.log(`[Embedding Viewer] File modified event:`, file.path);
+            scheduleLog('modify', file.path);
             scheduleIndex(file, 'modify');
+            this.updateFileExplorer();
+            const activeFile = this.app.workspace.getActiveFile();
+            if (activeFile && activeFile.path === file.path) {
+                this.updateFileStatus(activeFile);
+            }
         }));
         this.registerEvent(this.app.vault.on('create', (file) => {
-            console.log(`[Embedding Viewer] File created event:`, file.path);
+            scheduleLog('create', file.path);
             scheduleIndex(file, 'create');
+            this.updateFileExplorer();
         }));
         
         this.registerEvent(this.app.vault.on('delete', (file) => {
             if (file.path && file.path.endsWith('.md')) {
-                console.log(`[Embedding Viewer] File deleted event:`, file.path);
+                scheduleLog('delete', file.path);
                 if (indexDebouncers.has(file.path)) {
-                    clearTimeout(indexDebouncers.get(file.path)!);
+                    window.clearTimeout(indexDebouncers.get(file.path));
                     indexDebouncers.delete(file.path);
                 }
                 this.indexer.deleteFile(file.path);
+                this.updateFileExplorer();
             }
         }));
         
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
             if (file.path && file.path.endsWith('.md')) {
-                console.log(`[Embedding Viewer] File renamed event: ${oldPath} -> ${file.path}`);
+                scheduleLog('rename', `${oldPath} -> ${file.path}`);
                 this.indexer.deleteFile(oldPath);
                 scheduleIndex(file, 'rename');
+                this.updateFileExplorer();
             }
         }));
 
@@ -126,6 +173,45 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
         this.statusBarItem = this.addStatusBarItem();
         this.statusBarItem.setText('');
+
+        this.fileStatusItem = this.addStatusBarItem();
+        this.fileStatusItem.setText('🧠 Booting DB...');
+        
+        this.registerEvent(
+            this.app.workspace.on('file-open', (file) => {
+                this.updateFileStatus(file);
+            })
+        );
+        this.registerEvent(
+            this.app.workspace.on('active-leaf-change', () => {
+                window.setTimeout(() => {
+                    this.updateFileStatus(this.app.workspace.getActiveFile());
+                }, 50);
+            })
+        );
+        this.registerEvent(
+            this.app.workspace.on('layout-change', () => {
+                this.attachFileExplorerObservers();
+                this.updateFileExplorer();
+            })
+        );
+        
+        // Load DB in background and update UI once ready
+        this.dbManager.loadDb().then(() => {
+            if (this.app.workspace.layoutReady) {
+                const activeFile = this.app.workspace.getActiveFile();
+                this.updateFileStatus(activeFile);
+                this.attachFileExplorerObservers();
+                this.updateFileExplorer();
+            } else {
+                this.app.workspace.onLayoutReady(() => {
+                    const activeFile = this.app.workspace.getActiveFile();
+                    this.updateFileStatus(activeFile);
+                    this.attachFileExplorerObservers();
+                    this.updateFileExplorer();
+                });
+            }
+        });
 
         this.addCommand({
             id: 'toggle-chunk-visualizer',
@@ -221,6 +307,275 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
     }
 
+    getExcludedFolders(): string[] {
+        if (!this.settings.excludedFolders) return [];
+        return this.settings.excludedFolders
+            .split('\n')
+            .map((f: string) => f.trim().replace(/^(\.\/|\/)+/, '').replace(/\/+$/, ''))
+            .filter((f: string) => f.length > 0);
+    }
+
+    isPathExcluded(path: string, excludedList?: string[]): boolean {
+        if (path === 'profiler.md' || path.endsWith('/profiler.md')) {
+            return true;
+        }
+
+        const excluded = excludedList ?? this.getExcludedFolders();
+        if (excluded.length === 0) return false;
+
+        const normalizedPath = path.replace(/^(\.\/|\/)+/, '').replace(/\/+$/, '');
+
+        for (const ex of excluded) {
+            if (normalizedPath === ex || normalizedPath.startsWith(ex + '/')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    isFileExcluded(file: TFile, excludedList?: string[]): boolean {
+        if (this.isPathExcluded(file.path, excludedList)) {
+            return true;
+        }
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        if (cache?.frontmatter?.['exclude_embedding'] === true) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private fileExplorerObservers: MutationObserver[] = [];
+    private updateFileExplorerTimeout: number | null = null;
+
+    attachFileExplorerObservers() {
+        for (const obs of this.fileExplorerObservers) {
+            obs.disconnect();
+        }
+        this.fileExplorerObservers = [];
+
+        const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+        for (const leaf of leaves) {
+            const container = (leaf.view as any)?.containerEl;
+            if (!container) continue;
+            const obs = new MutationObserver((mutations) => {
+                const hasRelevantMutation = mutations.some((m) => {
+                    if (m.type === 'childList') return true;
+                    if (m.type === 'attributes' && m.attributeName === 'class') {
+                        const target = m.target as HTMLElement;
+                        const oldClass = m.oldValue || '';
+                        const currentClass = target.className || '';
+                        const wasCollapsed = oldClass.includes('is-collapsed');
+                        const isCollapsed = currentClass.includes('is-collapsed');
+                        if (wasCollapsed !== isCollapsed) return true;
+                        const stripOurClasses = (s: string) => s.replace(/embedding-(unindexed|pending|indexed)/g, '').trim();
+                        return stripOurClasses(oldClass) !== stripOurClasses(currentClass);
+                    }
+                    return false;
+                });
+                if (hasRelevantMutation) {
+                    this.updateFileExplorer();
+                }
+            });
+            obs.observe(container, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['class'],
+                attributeOldValue: true,
+            });
+            this.fileExplorerObservers.push(obs);
+        }
+    }
+    
+    updateFileExplorer() {
+        if (this.updateFileExplorerTimeout !== null) {
+            window.clearTimeout(this.updateFileExplorerTimeout);
+        }
+        
+        this.updateFileExplorerTimeout = window.setTimeout(() => {
+            const indexedPaths = new Map<string, number>();
+            const registry = this.dbManager.state.registry;
+            for (const p in registry) {
+                indexedPaths.set(p, registry[p]!.mtime);
+            }
+
+            const excludedList = this.getExcludedFolders();
+            const foldersWithUnindexed = new Set<string>();
+            const foldersWithPending = new Set<string>();
+
+            const mdFiles = this.app.vault.getMarkdownFiles();
+            for (const file of mdFiles) {
+                if (this.isFileExcluded(file, excludedList)) continue;
+
+                const isIndexed = indexedPaths.has(file.path);
+                let isPending = false;
+                let isUnindexed = false;
+
+                if (isIndexed) {
+                    const regTime = indexedPaths.get(file.path)!;
+                    const fileTime = Math.floor(file.stat.mtime);
+                    if (regTime !== fileTime) {
+                        isPending = true;
+                    }
+                } else {
+                    isUnindexed = true;
+                }
+
+                if (isUnindexed) {
+                    let parent = file.parent;
+                    while (parent && !parent.isRoot()) {
+                        foldersWithUnindexed.add(parent.path);
+                        parent = parent.parent;
+                    }
+                } else if (isPending) {
+                    let parent = file.parent;
+                    while (parent && !parent.isRoot()) {
+                        foldersWithPending.add(parent.path);
+                        parent = parent.parent;
+                    }
+                }
+            }
+
+            const fileExplorerLeaves = this.app.workspace.getLeavesOfType('file-explorer');
+            for (const leaf of fileExplorerLeaves) {
+                const fileItems = (leaf.view as any)?.fileItems;
+                if (!fileItems) continue;
+                
+                for (const path in fileItems) {
+                    const item = fileItems[path];
+                    const file = item?.file;
+                    if (!file) continue;
+                    
+                    const el = (item.selfEl || item.innerEl || item.titleEl || item.el) as HTMLElement | undefined;
+                    if (!el) continue;
+
+                    // Clean up any legacy injected span elements
+                    const legacySpan = el.querySelector?.('.embedding-indicator');
+                    if (legacySpan) legacySpan.remove();
+
+                    if (file instanceof TFile || 'extension' in file) {
+                        if ((file as TFile).extension !== 'md' || this.isFileExcluded(file as TFile, excludedList)) {
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            continue;
+                        }
+
+                        const isIndexed = indexedPaths.has(file.path);
+                        let shouldBePending = false;
+                        let shouldBeUnindexed = false;
+
+                        if (isIndexed) {
+                            const regTime = indexedPaths.get(file.path)!;
+                            const fileTime = Math.floor(file.stat.mtime);
+                            if (regTime !== fileTime) {
+                                shouldBePending = true;
+                            }
+                        } else {
+                            shouldBeUnindexed = true;
+                        }
+
+                        if (shouldBePending) {
+                            if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else if (shouldBeUnindexed) {
+                            if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else {
+                            // Indexed and up to date -> no color/badge
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                        }
+                    } else if (file instanceof TFolder || 'children' in file) {
+                        if (file.path === '/' || (file.isRoot && file.isRoot()) || this.isPathExcluded(file.path, excludedList)) {
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            continue;
+                        }
+
+                        const isCollapsed = Boolean(
+                            item.collapsed ||
+                            item.el?.classList?.contains('is-collapsed') ||
+                            item.selfEl?.classList?.contains('is-collapsed')
+                        );
+
+                        let shouldBePending = false;
+                        let shouldBeUnindexed = false;
+
+                        if (isCollapsed) {
+                            if (foldersWithUnindexed.has(file.path)) {
+                                shouldBeUnindexed = true;
+                            } else if (foldersWithPending.has(file.path)) {
+                                shouldBePending = true;
+                            }
+                        }
+
+                        if (shouldBeUnindexed) {
+                            if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else if (shouldBePending) {
+                            if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else {
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                        }
+                    }
+                }
+            }
+        }, 100);
+    }
+
+    async updateFileStatus(file: TFile | null) {
+        let targetFile = file;
+        if (!targetFile) {
+            targetFile = this.app.workspace.getActiveViewOfType(MarkdownView)?.file || null;
+        }
+
+        if (!targetFile || targetFile.extension !== 'md') {
+            if (this.fileStatusItem) this.fileStatusItem.setText('');
+            return;
+        }
+
+        if (this.isFileExcluded(targetFile)) {
+            if (this.fileStatusItem) {
+                this.fileStatusItem.setText('🧠 Excluded');
+                this.fileStatusItem.setAttribute('aria-label', 'This file is excluded from embedding index');
+            }
+            return;
+        }
+
+        try {
+            const reg = this.dbManager.state.registry[targetFile.path];
+            
+            if (reg) {
+                if (Math.floor(Number(reg.mtime)) === Math.floor(targetFile.stat.mtime)) {
+                    this.fileStatusItem.setText('🧠 Indexed');
+                    this.fileStatusItem.setAttribute('aria-label', 'This file is in the embedding index and up to date');
+                } else {
+                    this.fileStatusItem.setText('🧠 Pending Update');
+                    this.fileStatusItem.setAttribute('aria-label', 'This file has changes waiting to be indexed');
+                }
+            } else {
+                this.fileStatusItem.setText('🧠 Unindexed');
+                this.fileStatusItem.setAttribute('aria-label', 'This file is not indexed');
+            }
+        } catch (error) {
+            console.error('[Embedding Viewer] updateFileStatus error:', error);
+            this.fileStatusItem.setText('🧠 DB Error');
+        }
+    }
+
     async activateView() {
         const { workspace } = this.app;
         
@@ -262,6 +617,24 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
     async onunload() {
         this.cleanupProcess();
+        for (const obs of this.fileExplorerObservers) {
+            obs.disconnect();
+        }
+        this.fileExplorerObservers = [];
+
+        // Remove indicator classes from explorer
+        const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+        for (const leaf of leaves) {
+            const fileItems = (leaf.view as any)?.fileItems;
+            if (!fileItems) continue;
+            for (const path in fileItems) {
+                const el = (fileItems[path]?.selfEl || fileItems[path]?.el) as HTMLElement | undefined;
+                if (el) {
+                    el.classList.remove('embedding-indexed', 'embedding-pending', 'embedding-unindexed');
+                }
+            }
+        }
+
         if (this.api) {
             this.api.stop();
         }

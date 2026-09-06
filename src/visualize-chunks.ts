@@ -3,6 +3,7 @@ import { EditorView, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@
 import { App, editorInfoField, TFile } from 'obsidian';
 import { Indexer, Chunk } from './indexer';
 import EmbeddingViewerPlugin from './main';
+import { buildSimilarTooltip, attachDismissHandler } from './hover-widget';
 
 export const toggleVisualizerEffect = StateEffect.define<boolean>();
 
@@ -93,10 +94,15 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
             timer: number | null = null;
             lastHoveredChunkIndex: number | null = null;
             currentTooltip: HTMLElement | null = null;
+            cleanupDismiss: (() => void) | null = null;
+            cachedChunks: Chunk[] | null = null;
 
             constructor(public view: EditorView) {}
 
             update(update: ViewUpdate) {
+                if (update.docChanged) {
+                    this.cachedChunks = null;
+                }
                 if (update.docChanged || update.selectionSet) {
                     this.clear();
                 }
@@ -113,6 +119,10 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                 if (this.currentTooltip) {
                     this.currentTooltip.remove();
                     this.currentTooltip = null;
+                }
+                if (this.cleanupDismiss) {
+                    this.cleanupDismiss();
+                    this.cleanupDismiss = null;
                 }
             }
 
@@ -143,13 +153,16 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                 const file = fileInfo?.file;
                 if (!file || !(file instanceof TFile)) return;
 
-                const content = view.state.doc.toString();
-                let chunks: Chunk[] = [];
-                try {
-                    chunks = indexer.extractChunks(content, file, plugin.settings.lastExcludedPhrases);
-                } catch (err) {
-                    this.clear();
-                    return;
+                let chunks = this.cachedChunks;
+                if (!chunks) {
+                    const content = view.state.doc.toString();
+                    try {
+                        chunks = indexer.extractChunks(content, file, plugin.settings.lastExcludedPhrases);
+                        this.cachedChunks = chunks;
+                    } catch (err) {
+                        this.clear();
+                        return;
+                    }
                 }
 
                 const lineNum = view.state.doc.lineAt(posInfo).number - 1;
@@ -171,95 +184,34 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                 const text = chunk.content.trim();
                 if (!text) return;
 
-                this.timer = window.setTimeout(() => this.triggerHover(chunk, text, file, e.clientX, e.clientY), 800);
+                this.timer = window.setTimeout(() => { 
+                    this.triggerHover(chunk, text, file, e.clientX, e.clientY).catch(err => {
+                        console.error('Hover trigger failed:', err);
+                    }); 
+                }, 300);
             }
 
-            async triggerHover(chunk: Chunk, text: string, file: TFile, x: number, y: number) {
+            async triggerHover(_chunk: Chunk, text: string, file: TFile, x: number, y: number) {
                 try {
                     const cleanSelection = indexer.stripWikilinks(text);
                     const vectors = await indexer.embed([cleanSelection]);
                     if (vectors.length === 0) return;
-                    
+
                     const vector = vectors[0] as number[];
-                    const excludePath = file.path;
-                    
-                    const results = await plugin.queryService.findSimilarForVector(vector, excludePath, 3);
+                    const results = await plugin.queryService.findSimilarForVector(vector, file.path, 3);
                     if (results.length === 0) return;
 
-                    const dom = document.createElement('div');
-                    dom.className = 'embedding-hover-tooltip';
+                    const dom = buildSimilarTooltip(app, results, 'Similar Snippets (Chunk)');
+                    dom.classList.add('read-mode-tooltip', 'embedding-popup-container');
                     dom.style.position = 'absolute';
                     dom.style.left = `${x}px`;
                     dom.style.top = `${y + 20}px`;
-                    dom.style.padding = '10px';
-                    dom.style.maxWidth = '350px';
-                    dom.style.backgroundColor = 'var(--background-primary)';
-                    dom.style.border = '1px solid var(--background-modifier-border)';
-                    dom.style.borderRadius = '8px';
-                    dom.style.boxShadow = '0 8px 16px rgba(0,0,0,0.2)';
-                    dom.style.zIndex = '1000';
-                    dom.style.cursor = 'default';
 
-                    const title = dom.createEl('div', { text: 'Similar Snippets (Chunk)', cls: 'embedding-hover-title' });
-                    title.style.fontWeight = 'bold';
-                    title.style.marginBottom = '8px';
-                    title.style.fontSize = '0.95em';
-                    title.style.color = 'var(--text-normal)';
-                    title.style.borderBottom = '1px solid var(--background-modifier-border)';
-                    title.style.paddingBottom = '4px';
-
-                    for (const res of results) {
-                        const item = dom.createEl('div');
-                        item.style.marginBottom = '8px';
-                        item.style.fontSize = '0.85em';
-
-                        const headerDiv = item.createDiv();
-                        const pathSpan = headerDiv.createEl('a', { text: res.path, href: '#' });
-                        pathSpan.style.color = 'var(--text-accent)';
-                        pathSpan.style.textDecoration = 'none';
-                        pathSpan.style.fontWeight = '500';
-                        
-                        let scoreText = ` ${(res.similarity * 100).toFixed(0)}%`;
-                        if (res.linkPenalty > 0) {
-                            scoreText += ' 🔗↓';
-                        }
-                        const scoreSpan = headerDiv.createSpan({ text: scoreText });
-                        scoreSpan.style.color = 'var(--text-muted)';
-                        scoreSpan.style.float = 'right';
-                        scoreSpan.style.fontSize = '0.9em';
-                        if (res.linkPenalty > 0) {
-                            scoreSpan.title = `Penalized by -${Math.round(res.linkPenalty * 100)}% because it is already linked.`;
-                        }
-
-                        const preview = item.createDiv({ text: res.content });
-                        preview.style.opacity = '0.85';
-                        preview.style.marginTop = '4px';
-                        preview.style.color = 'var(--text-normal)';
-                        preview.style.display = '-webkit-box';
-                        preview.style.webkitLineClamp = '3';
-                        preview.style.webkitBoxOrient = 'vertical';
-                        preview.style.overflow = 'hidden';
-                        preview.style.borderLeft = '2px solid var(--text-accent)';
-                        preview.style.paddingLeft = '6px';
-
-                        pathSpan.onclick = (e) => {
-                            e.preventDefault();
-                            app.workspace.openLinkText(res.path, '', true);
-                        };
-                    }
-                    
                     document.body.appendChild(dom);
                     this.currentTooltip = dom;
-
-                    const onClickOutside = (e: MouseEvent) => {
-                        if (!this.currentTooltip || !this.currentTooltip.contains(e.target as Node)) {
-                            this.clear();
-                            document.removeEventListener('mousedown', onClickOutside);
-                        }
-                    };
-                    setTimeout(() => document.addEventListener('mousedown', onClickOutside), 0);
+                    this.cleanupDismiss = attachDismissHandler(dom, () => this.clear());
                 } catch (err) {
-                    console.error(err);
+                    console.error('Trigger hover failed', err);
                 }
             }
         }, {
@@ -268,9 +220,6 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                     (this as any).handleMove(e, view);
                 },
                 mouseleave(e, view) {
-                    // Do not clear immediately on mouseleave if they are moving to the tooltip
-                    // Actually, the tooltip is appended to body, so moving to tooltip might trigger mouseleave on editor.
-                    // We can handle this by checking relatedTarget.
                     const target = e.relatedTarget as Node;
                     if ((this as any).currentTooltip && (this as any).currentTooltip.contains(target)) {
                         return;

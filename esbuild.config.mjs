@@ -5,7 +5,6 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-// Parse .env for OBSIDIAN_VAULT_PATH
 let env = {};
 if (fs.existsSync('.env')) {
 	const envFile = fs.readFileSync('.env', 'utf8');
@@ -13,7 +12,7 @@ if (fs.existsSync('.env')) {
 		const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
 		if (match) {
 			let value = match[2] || '';
-			value = value.replace(/(^['"]|['"]$)/g, ''); // strip quotes
+			value = value.replace(/(^['"]|['"]$)/g, '');
 			env[match[1]] = value;
 		}
 	});
@@ -32,26 +31,15 @@ if you want to view the source, please visit the github repository of this plugi
 const prod = process.argv[2] === 'production';
 const outDir = 'build';
 
-const copyAndReplacePlugin = {
-	name: 'copy-and-replace-plugin',
+const copyPlugin = {
+	name: 'copy-plugin',
 	setup(build) {
-		build.onLoad({ filter: /pglite/ }, async (args) => {
-			let text = await fs.promises.readFile(args.path, 'utf8');
-			text = text.replace(/import\.meta\.url/g, "(window.app.vault.adapter.getResourcePath('.obsidian/plugins/embedding-viewer/main.js').split('?')[0])");
-			return { contents: text, loader: 'js' };
-		});
 		build.onEnd(() => {
 			if (!fs.existsSync(outDir)) {
 				fs.mkdirSync(outDir, { recursive: true });
 			}
 
-			const pgliteDist = 'node_modules/@electric-sql/pglite/dist';
-			const vectorDist = 'node_modules/@electric-sql/pglite-pgvector/dist';
 			const filesToCopy = [
-				path.join(pgliteDist, 'pglite.wasm'),
-				path.join(pgliteDist, 'pglite.data'),
-				path.join(pgliteDist, 'initdb.wasm'),
-				path.join(vectorDist, 'vector.tar.gz'),
 				'manifest.json',
 				'styles.css'
 			];
@@ -107,9 +95,9 @@ const context = await esbuild.context({
 	logLevel: 'info',
 	sourcemap: prod ? false : 'inline',
 	treeShaking: true,
-	outfile: path.join(outDir, 'main.js'),
-	minify: prod,
-	plugins: [copyAndReplacePlugin],
+	outdir: outDir,
+	minify: false,
+	plugins: [copyPlugin],
 });
 
 if (prod) {

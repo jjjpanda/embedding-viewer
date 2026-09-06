@@ -14,7 +14,8 @@ export interface EmbeddingViewerSettings {
     apiPort: number;
     onLaunchCommand: string;
     lastExcludedPhrases: string[];
-    graphLayers: number;
+    batchSize: number;
+    bulkIndexThreshold: number;
 }
 
 export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
@@ -30,7 +31,8 @@ export const DEFAULT_SETTINGS: EmbeddingViewerSettings = {
     apiPort: 27123,
     onLaunchCommand: '',
     lastExcludedPhrases: [],
-    graphLayers: 5,
+    batchSize: 50,
+    bulkIndexThreshold: 20,
 };
 
 export class EmbeddingViewerSettingTab extends PluginSettingTab {
@@ -46,7 +48,7 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
 
         containerEl.empty();
 
-        containerEl.createEl('h3', { text: 'Model Configuration' });
+        new Setting(containerEl).setName("Model Configuration").setHeading();
 
         new Setting(containerEl)
             .setName('Embedding Endpoint')
@@ -81,7 +83,7 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        containerEl.createEl('h3', { text: 'Chunking & Searching' });
+        new Setting(containerEl).setName("Chunking & Searching").setHeading();
 
         new Setting(containerEl)
             .setName('Chunk Size')
@@ -93,6 +95,34 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     const parsed = parseInt(value, 10);
                     if (!isNaN(parsed)) {
                         this.plugin.settings.chunkSize = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Batch Size')
+            .setDesc('Number of text chunks to embed in a single request. (Default 50)')
+            .addText(text => text
+                .setPlaceholder('50')
+                .setValue(this.plugin.settings.batchSize.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value, 10);
+                    if (!isNaN(parsed) && parsed > 0) {
+                        this.plugin.settings.batchSize = parsed;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Bulk Index Threshold')
+            .setDesc('If more than this many files are queued for indexing, trigger a fast multi-file rebuild instead. (Default 20)')
+            .addText(text => text
+                .setPlaceholder('20')
+                .setValue(this.plugin.settings.bulkIndexThreshold.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value, 10);
+                    if (!isNaN(parsed) && parsed > 0) {
+                        this.plugin.settings.bulkIndexThreshold = parsed;
                         await this.plugin.saveSettings();
                     }
                 }));
@@ -153,24 +183,7 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     }
                 }));
 
-        new Setting(containerEl)
-            .setName('Graph Layers')
-            .setDesc('Number of recursive layers to fetch for the Similar Documents Graph.')
-            .addSlider(slider => slider
-                .setLimits(1, 8, 1)
-                .setValue(this.plugin.settings.graphLayers)
-                .setDynamicTooltip()
-                .onChange(async (value) => {
-                    this.plugin.settings.graphLayers = value;
-                    await this.plugin.saveSettings();
-                    this.plugin.app.workspace.getLeavesOfType('similar-notes-view').forEach(leaf => {
-                        if (leaf.view && (leaf.view as any).updateView) {
-                            (leaf.view as any).updateView();
-                        }
-                    });
-                }));
-
-        containerEl.createEl('h3', { text: 'Advanced' });
+        new Setting(containerEl).setName("Advanced").setHeading();
 
         new Setting(containerEl)
             .setName('Excluded Folders')
@@ -181,6 +194,11 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                 .onChange(async (value) => {
                     this.plugin.settings.excludedFolders = value;
                     await this.plugin.saveSettings();
+                    this.plugin.updateFileExplorer();
+                    const activeFile = this.plugin.app.workspace.getActiveFile();
+                    if (activeFile) {
+                        this.plugin.updateFileStatus(activeFile);
+                    }
                 }));
 
         new Setting(containerEl)
