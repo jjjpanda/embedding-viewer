@@ -1,13 +1,13 @@
 # Obsidian Embedding Viewer Plugin
 
-A local semantic search and related notes plugin for Obsidian. Uses **PGlite** and **pgvector** (via IndexedDB) to maintain an index of your vault's semantic embeddings and provides inline visualization of similar notes directly within your editor.
+A local semantic search and related notes plugin for Obsidian. Maintains a fast, local index of your vault's semantic embeddings and provides inline visualization of similar notes directly within your editor.
 
 ## Features
 
 - **Inline Similar Notes**: Automatically view semantically similar notes in a sidebar panel.
 - **Semantic Search on Selection**: Highlight any text, right-click, and select "Find similar notes for selection" to see related notes in a modal.
 - **Hover Tooltips**: Select text in edit or reading mode to see similar snippets in a tooltip. In edit mode, you can insert a wikilink directly from the tooltip.
-- **Local Querying**: Queries a locally bundled PGlite WASM database. You do not need a running embedding server to view similar notes after indexing.
+- **Local Querying**: Queries pre-computed local embeddings. You do not need a running embedding server to view similar notes after indexing.
 - **Recency Penalty**: Older notes receive a configurable similarity penalty to keep results fresh.
 - **Link Penalty**: Notes already linked to/from the active note are penalized to surface new connections.
 - **Custom Markdown Chunking**: Splits files by headings and paragraphs for high-quality embeddings.
@@ -57,13 +57,13 @@ The plugin runs an HTTP server (default port `27123`, localhost only) for extern
 
 ## How It Works
 
-When you open a note, the plugin queries an IndexedDB-backed PGlite vector database for the pre-calculated embeddings of the active file. It runs a pgvector cosine distance search across the vault's chunks, sorts them by similarity (with recency and link penalties applied), and displays the top results in a sidebar panel.
+When you open a note, the plugin queries the locally cached binary embeddings of your vault. It computes cosine similarity across chunks, sorts them by similarity (with recency and link penalties applied), and displays the top results in a sidebar panel.
 
 ## Development
 
 - `npm run dev` — start compilation in watch mode.
 - `npm run lint` — run ESLint.
-- PGlite's WASM dependencies are handled automatically by a custom esbuild configuration.
+- `npm run build` — build for production.
 
 ## License
 

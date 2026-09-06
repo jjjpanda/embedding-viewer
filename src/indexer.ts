@@ -265,7 +265,7 @@ export class Indexer {
                 if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
                 this.rebuildIndex((msg) => {
                     if (this.plugin.statusBarItem) {
-                        this.plugin.statusBarItem.setText(msg === null ? '' : `?? ${msg}`);
+                        this.plugin.statusBarItem.setText(msg === null ? '' : `🧠 ${msg}`);
                     }
                 });
                 return;
@@ -291,7 +291,7 @@ export class Indexer {
                 }
 
                 if (this.plugin.statusBarItem) {
-                    this.plugin.statusBarItem.setText(`?? Indexing ${file.basename}...`);
+                    this.plugin.statusBarItem.setText(`🧠 Indexing ${file.basename}...`);
                 }
 
                 // Delete old embeddings for this file
