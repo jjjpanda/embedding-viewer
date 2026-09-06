@@ -16,7 +16,12 @@ export class LocalApi {
 
     private isOriginAllowed(origin: string | undefined): boolean {
         if (!origin) return true;
-        return ALLOWED_ORIGINS.some(a => origin === a || origin.startsWith(a + ':'));
+        try {
+            const parsed = new URL(origin);
+            return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost';
+        } catch {
+            return false;
+        }
     }
 
     private readBody(req: http.IncomingMessage): Promise<string> {
@@ -38,7 +43,7 @@ export class LocalApi {
     }
 
     start() {
-        if (this.server) return;
+        if (this.server || !this.plugin.settings.enableApi) return;
 
         this.server = http.createServer(async (req, res) => {
             const origin = req.headers.origin;
@@ -90,7 +95,8 @@ export class LocalApi {
                         }
 
                         const cleanQuery = this.plugin.indexer.stripWikilinks(query);
-                        const vectors = await this.plugin.indexer.embed([cleanQuery]);
+                        const queryText = `${this.plugin.settings.embeddingQueryPrefix || ''}${cleanQuery}`;
+                        const vectors = await this.plugin.indexer.embed([queryText]);
                         if (vectors.length === 0) {
                             res.writeHead(500);
                             res.end(JSON.stringify({ error: 'Failed to generate embedding' }));
@@ -121,7 +127,8 @@ export class LocalApi {
                     }
 
                     const cleanQuery = this.plugin.indexer.stripWikilinks(query);
-                    const vectors = await this.plugin.indexer.embed([cleanQuery]);
+                    const queryText = `${this.plugin.settings.embeddingQueryPrefix || ''}${cleanQuery}`;
+                    const vectors = await this.plugin.indexer.embed([queryText]);
                     if (vectors.length === 0) {
                         res.writeHead(500);
                         res.end(JSON.stringify({ error: 'Failed to generate embedding' }));

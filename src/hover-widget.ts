@@ -105,6 +105,10 @@ export function createHoverTooltipPlugin(app: App, plugin: EmbeddingViewerPlugin
             if (update.selectionSet || update.docChanged) {
                 if (this.timer) window.clearTimeout(this.timer);
 
+                if (!plugin.settings.enableHoverTooltip) {
+                    return;
+                }
+
                 const state = update.state;
                 const selection = state.selection.main;
 
@@ -119,8 +123,10 @@ export function createHoverTooltipPlugin(app: App, plugin: EmbeddingViewerPlugin
 
         async triggerSearch(text: string, from: number, to: number) {
             try {
+                if (!plugin.settings.enableHoverTooltip) return;
                 const cleanSelection = plugin.indexer.stripWikilinks(text);
-                const vectors = await plugin.indexer.embed([cleanSelection]);
+                const queryText = `${plugin.settings.embeddingQueryPrefix || ''}${cleanSelection}`;
+                const vectors = await plugin.indexer.embed([queryText]);
                 if (vectors.length === 0) return;
                 const vector = vectors[0] as number[];
 
@@ -233,8 +239,10 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
 
         timer = window.setTimeout(async () => {
             try {
+                if (!plugin.settings.enableHoverTooltip) return;
                 const cleanSelection = plugin.indexer.stripWikilinks(text);
-                const vectors = await plugin.indexer.embed([cleanSelection]);
+                const queryText = `${plugin.settings.embeddingQueryPrefix || ''}${cleanSelection}`;
+                const vectors = await plugin.indexer.embed([queryText]);
                 if (vectors.length === 0) return;
                 const vector = vectors[0] as number[];
 

@@ -37,7 +37,7 @@ export class QueryService {
             const resultsArrays = [];
             for (const r of selectedRows) {
                 if (!r.vector) continue;
-                const matches = await this.findSimilarForVector(Array.from(r.vector), filePath, FETCH_K);
+                const matches = await this.findSimilarForVector(r.vector, filePath, FETCH_K);
                 resultsArrays.push(matches.map(m => ({ sourceContent: r.content, sourceHeading: r.metadata.heading || null, match: m })));
             }
             const allCandidates = resultsArrays.flat();
@@ -82,12 +82,13 @@ export class QueryService {
         }
     }
 
-    async findSimilarForVector(vector: number[], excludePath?: string, topK: number = 5): Promise<QueryResult[]> {
+    async findSimilarForVector(vector: number[] | Float32Array, excludePath?: string, topK: number = 5): Promise<QueryResult[]> {
         await this.dbManager.waitForLoad();
         try {
             const nowMs = Date.now();
             const msPerMonth = 1000 * 60 * 60 * 24 * 30;
             const maxSim = this.plugin.settings.maximumSimilarity ?? 0.95;
+            const penaltyRate = (this.plugin.settings.linkPenalty ?? 30) / 100.0;
 
             let linkedPaths = new Set<string>();
             if (excludePath) {
@@ -112,7 +113,7 @@ export class QueryService {
                 if (rawSimilarity >= maxSim) continue;
 
                 const timePenalty = (((nowMs - chunk.mtime) / msPerMonth) * (this.plugin.settings.penaltyPerMonth / 100.0));
-                const linkPenalty = linkedPaths.has(chunk.path) ? 0.30 : 0;
+                const linkPenalty = linkedPaths.has(chunk.path) ? penaltyRate : 0;
                 const similarity = rawSimilarity - timePenalty - linkPenalty;
                 
                 if (similarity >= this.plugin.settings.minimumSimilarity) {

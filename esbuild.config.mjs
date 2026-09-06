@@ -55,9 +55,12 @@ const copyPlugin = {
 				if (!fs.existsSync(pluginDir)) {
 					fs.mkdirSync(pluginDir, { recursive: true });
 				}
-				const buildFiles = fs.readdirSync(outDir);
-				buildFiles.forEach(f => {
-					fs.copyFileSync(path.join(outDir, f), path.join(pluginDir, f));
+				const filesToSync = ['main.js', 'manifest.json', 'styles.css'];
+				filesToSync.forEach(f => {
+					const src = path.join(outDir, f);
+					if (fs.existsSync(src)) {
+						fs.copyFileSync(src, path.join(pluginDir, f));
+					}
 				});
 				console.log(`Copied build artifacts to ${pluginDir}`);
 			} else {

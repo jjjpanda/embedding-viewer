@@ -1,4 +1,4 @@
-import { Plugin, Notice, MarkdownView, WorkspaceLeaf, Menu, TFile, TFolder, setIcon } from 'obsidian';
+import { Plugin, Notice, MarkdownView, WorkspaceLeaf, TFile } from 'obsidian';
 import { DatabaseManager } from './db';
 import { Indexer } from './indexer';
 import { QueryService } from './query';
@@ -7,7 +7,8 @@ import { createChunkVisualizer, toggleVisualizerEffect } from './visualize-chunk
 import { EmbeddingViewerSettings, DEFAULT_SETTINGS, EmbeddingViewerSettingTab } from './settings';
 import { SimilarityModal } from './modal';
 import { LocalApi } from './api';
-import { spawn, execSync, ChildProcess } from 'child_process';
+import { ServerProcessManager } from './server-process';
+import { FileExplorerManager } from './file-explorer';
 import { hoverTooltipField, createHoverTooltipPlugin, setupReadModeHover } from './hover-widget';
 
 export default class EmbeddingViewerPlugin extends Plugin {
@@ -16,51 +17,29 @@ export default class EmbeddingViewerPlugin extends Plugin {
     queryService!: QueryService;
     indexer!: Indexer;
     api!: LocalApi;
+    serverProcessManager!: ServerProcessManager;
+    fileExplorerManager!: FileExplorerManager;
     visualizerActive: boolean = false;
-    onLaunchProcess: ChildProcess | null = null;
     statusBarItem!: HTMLElement;
     fileStatusItem!: HTMLElement;
 
     async onload() {
         await this.loadSettings();
 
+        this.serverProcessManager = new ServerProcessManager();
         if (this.settings.onLaunchCommand) {
-            console.log(`Executing on-launch command: ${this.settings.onLaunchCommand}`);
-            this.onLaunchProcess = spawn(this.settings.onLaunchCommand, { shell: true });
-            
-            this.onLaunchProcess.stdout?.on('data', (data) => {
-                console.log(`On-launch command stdout: ${data}`);
-            });
-            this.onLaunchProcess.stderr?.on('data', (data) => {
-                console.error(`On-launch command stderr: ${data}`);
-            });
-            this.onLaunchProcess.on('error', (error) => {
-                console.error(`On-launch command error: ${error.message}`);
-                new Notice(`Startup command failed: ${error.message}`);
-            });
-            this.onLaunchProcess.on('exit', (code) => {
-                if (code !== null && code !== 0) {
-                    console.error(`On-launch command exited with code ${code}`);
-                    new Notice(`Startup command exited with code ${code}`);
-                }
-            });
+            this.serverProcessManager.start(this.settings.onLaunchCommand);
         }
-        
-        this.registerDomEvent(window, 'beforeunload', () => this.cleanupProcess());
+        this.registerDomEvent(window, 'beforeunload', () => this.serverProcessManager.stop());
 
         this.dbManager = new DatabaseManager(this);
         this.queryService = new QueryService(this.dbManager, this);
+        this.indexer = new Indexer(this.app, this.dbManager, this);
+        this.fileExplorerManager = new FileExplorerManager(this.app, this);
 
+        const indexDebouncers = new Map<string, number>();
 
-        this.indexer = new Indexer(
-            this.app,
-            this.dbManager,
-            this
-        );
-
-        const indexDebouncers = new Map<string, any>();
-        
-        const scheduleIndex = (file: any, eventName: string) => {
+        const scheduleIndex = (file: TFile) => {
             if (file.extension !== 'md') return;
 
             if (this.isFileExcluded(file)) {
@@ -76,75 +55,41 @@ export default class EmbeddingViewerPlugin extends Plugin {
                 this.indexer.queueFileForIndex(file);
             }, this.settings.debounceTime || 15000));
         };
-        
-        const eventBatches = {
-            create: new Set<string>(),
-            modify: new Set<string>(),
-            delete: new Set<string>(),
-            rename: new Set<string>()
-        };
-        let batchLogTimeout: any = null;
-
-        const logBatch = () => {
-            if (eventBatches.create.size > 0) {
-                console.log(`[Embedding Viewer] Files created (${eventBatches.create.size}):`, Array.from(eventBatches.create));
-                eventBatches.create.clear();
-            }
-            if (eventBatches.modify.size > 0) {
-                console.log(`[Embedding Viewer] Files modified (${eventBatches.modify.size}):`, Array.from(eventBatches.modify));
-                eventBatches.modify.clear();
-            }
-            if (eventBatches.delete.size > 0) {
-                console.log(`[Embedding Viewer] Files deleted (${eventBatches.delete.size}):`, Array.from(eventBatches.delete));
-                eventBatches.delete.clear();
-            }
-            if (eventBatches.rename.size > 0) {
-                console.log(`[Embedding Viewer] Files renamed (${eventBatches.rename.size}):`, Array.from(eventBatches.rename));
-                eventBatches.rename.clear();
-            }
-            batchLogTimeout = null;
-        };
-
-        const scheduleLog = (type: keyof typeof eventBatches, msg: string) => {
-            eventBatches[type].add(msg);
-            if (!batchLogTimeout) {
-                batchLogTimeout = window.setTimeout(logBatch, 2000);
-            }
-        };
 
         this.registerEvent(this.app.vault.on('modify', (file) => {
-            scheduleLog('modify', file.path);
-            scheduleIndex(file, 'modify');
-            this.updateFileExplorer();
-            const activeFile = this.app.workspace.getActiveFile();
-            if (activeFile && activeFile.path === file.path) {
-                this.updateFileStatus(activeFile);
+            if (file instanceof TFile) {
+                scheduleIndex(file);
+                this.fileExplorerManager.updateFileExplorer();
+                const activeFile = this.app.workspace.getActiveFile();
+                if (activeFile && activeFile.path === file.path) {
+                    this.updateFileStatus(activeFile);
+                }
             }
         }));
+
         this.registerEvent(this.app.vault.on('create', (file) => {
-            scheduleLog('create', file.path);
-            scheduleIndex(file, 'create');
-            this.updateFileExplorer();
+            if (file instanceof TFile) {
+                scheduleIndex(file);
+                this.fileExplorerManager.updateFileExplorer();
+            }
         }));
-        
+
         this.registerEvent(this.app.vault.on('delete', (file) => {
             if (file.path && file.path.endsWith('.md')) {
-                scheduleLog('delete', file.path);
                 if (indexDebouncers.has(file.path)) {
                     window.clearTimeout(indexDebouncers.get(file.path));
                     indexDebouncers.delete(file.path);
                 }
                 this.indexer.deleteFile(file.path);
-                this.updateFileExplorer();
+                this.fileExplorerManager.updateFileExplorer();
             }
         }));
-        
+
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-            if (file.path && file.path.endsWith('.md')) {
-                scheduleLog('rename', `${oldPath} -> ${file.path}`);
+            if (file instanceof TFile && file.path.endsWith('.md')) {
                 this.indexer.deleteFile(oldPath);
-                scheduleIndex(file, 'rename');
-                this.updateFileExplorer();
+                scheduleIndex(file);
+                this.fileExplorerManager.updateFileExplorer();
             }
         }));
 
@@ -166,9 +111,10 @@ export default class EmbeddingViewerPlugin extends Plugin {
         setupReadModeHover(this.app, this);
 
         this.api = new LocalApi(this);
-        this.api.start();
+        if (this.settings.enableApi) {
+            this.api.start();
+        }
 
-        // This adds a settings tab so the user can configure various aspects of the plugin
         this.addSettingTab(new EmbeddingViewerSettingTab(this.app, this));
 
         this.statusBarItem = this.addStatusBarItem();
@@ -176,7 +122,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
         this.fileStatusItem = this.addStatusBarItem();
         this.fileStatusItem.setText('🧠 Booting DB...');
-        
+
         this.registerEvent(
             this.app.workspace.on('file-open', (file) => {
                 this.updateFileStatus(file);
@@ -191,25 +137,23 @@ export default class EmbeddingViewerPlugin extends Plugin {
         );
         this.registerEvent(
             this.app.workspace.on('layout-change', () => {
-                this.attachFileExplorerObservers();
-                this.updateFileExplorer();
+                this.fileExplorerManager.attachObservers();
+                this.fileExplorerManager.updateFileExplorer();
             })
         );
-        
-        // Load DB in background and update UI once ready
+
         this.dbManager.loadDb().then(() => {
-            if (this.app.workspace.layoutReady) {
+            const onReady = () => {
                 const activeFile = this.app.workspace.getActiveFile();
                 this.updateFileStatus(activeFile);
-                this.attachFileExplorerObservers();
-                this.updateFileExplorer();
+                this.fileExplorerManager.attachObservers();
+                this.fileExplorerManager.updateFileExplorer();
+            };
+
+            if (this.app.workspace.layoutReady) {
+                onReady();
             } else {
-                this.app.workspace.onLayoutReady(() => {
-                    const activeFile = this.app.workspace.getActiveFile();
-                    this.updateFileStatus(activeFile);
-                    this.attachFileExplorerObservers();
-                    this.updateFileExplorer();
-                });
+                this.app.workspace.onLayoutReady(onReady);
             }
         });
 
@@ -219,7 +163,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             callback: () => {
                 this.visualizerActive = !this.visualizerActive;
                 new Notice(`Chunk Visualizer ${this.visualizerActive ? 'ON' : 'OFF'}`);
-                
+
                 this.app.workspace.iterateAllLeaves((leaf) => {
                     if (leaf.view instanceof MarkdownView && leaf.view.editor) {
                         // @ts-ignore - internal cm property
@@ -239,11 +183,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             name: 'Rebuild vault index',
             callback: async () => {
                 await this.indexer.rebuildIndex((msg) => {
-                    if (msg === null) {
-                        this.statusBarItem.setText('');
-                    } else {
-                        this.statusBarItem.setText(`🧠 ${msg}`);
-                    }
+                    this.statusBarItem.setText(msg === null ? '' : `🧠 ${msg}`);
                 });
             },
         });
@@ -253,11 +193,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             name: 'Force rebuild vault index',
             callback: async () => {
                 await this.indexer.rebuildIndex((msg) => {
-                    if (msg === null) {
-                        this.statusBarItem.setText('');
-                    } else {
-                        this.statusBarItem.setText(`🧠 ${msg}`);
-                    }
+                    this.statusBarItem.setText(msg === null ? '' : `🧠 ${msg}`);
                 }, true);
             },
         });
@@ -276,19 +212,20 @@ export default class EmbeddingViewerPlugin extends Plugin {
                             .setIcon('search')
                             .onClick(async () => {
                                 new Notice('Analyzing selection similarity...');
-                                
+
                                 try {
                                     const cleanSelection = this.indexer.stripWikilinks(selection);
-                                    const vectors = await this.indexer.embed([cleanSelection]);
+                                    const queryText = `${this.settings.embeddingQueryPrefix || ''}${cleanSelection}`;
+                                    const vectors = await this.indexer.embed([queryText]);
                                     if (vectors.length === 0) {
                                         new Notice('Failed to generate embedding for selection.');
                                         return;
                                     }
 
                                     const vector = vectors[0] as number[];
-                                    let excludePath = view.file ? view.file.path : undefined;
+                                    const excludePath = view.file ? view.file.path : undefined;
                                     const results = await this.queryService.findSimilarForVector(vector, excludePath, 5);
-                                    
+
                                     if (results.length === 0) {
                                         new Notice('No similar chunks found.');
                                         return;
@@ -304,7 +241,10 @@ export default class EmbeddingViewerPlugin extends Plugin {
                 }
             })
         );
+    }
 
+    updateFileExplorer() {
+        this.fileExplorerManager.updateFileExplorer();
     }
 
     getExcludedFolders(): string[] {
@@ -347,195 +287,6 @@ export default class EmbeddingViewerPlugin extends Plugin {
         return false;
     }
 
-    private fileExplorerObservers: MutationObserver[] = [];
-    private updateFileExplorerTimeout: number | null = null;
-
-    attachFileExplorerObservers() {
-        for (const obs of this.fileExplorerObservers) {
-            obs.disconnect();
-        }
-        this.fileExplorerObservers = [];
-
-        const leaves = this.app.workspace.getLeavesOfType('file-explorer');
-        for (const leaf of leaves) {
-            const container = (leaf.view as any)?.containerEl;
-            if (!container) continue;
-            const obs = new MutationObserver((mutations) => {
-                const hasRelevantMutation = mutations.some((m) => {
-                    if (m.type === 'childList') return true;
-                    if (m.type === 'attributes' && m.attributeName === 'class') {
-                        const target = m.target as HTMLElement;
-                        const oldClass = m.oldValue || '';
-                        const currentClass = target.className || '';
-                        const wasCollapsed = oldClass.includes('is-collapsed');
-                        const isCollapsed = currentClass.includes('is-collapsed');
-                        if (wasCollapsed !== isCollapsed) return true;
-                        const stripOurClasses = (s: string) => s.replace(/embedding-(unindexed|pending|indexed)/g, '').trim();
-                        return stripOurClasses(oldClass) !== stripOurClasses(currentClass);
-                    }
-                    return false;
-                });
-                if (hasRelevantMutation) {
-                    this.updateFileExplorer();
-                }
-            });
-            obs.observe(container, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['class'],
-                attributeOldValue: true,
-            });
-            this.fileExplorerObservers.push(obs);
-        }
-    }
-    
-    updateFileExplorer() {
-        if (this.updateFileExplorerTimeout !== null) {
-            window.clearTimeout(this.updateFileExplorerTimeout);
-        }
-        
-        this.updateFileExplorerTimeout = window.setTimeout(() => {
-            const indexedPaths = new Map<string, number>();
-            const registry = this.dbManager.state.registry;
-            for (const p in registry) {
-                indexedPaths.set(p, registry[p]!.mtime);
-            }
-
-            const excludedList = this.getExcludedFolders();
-            const foldersWithUnindexed = new Set<string>();
-            const foldersWithPending = new Set<string>();
-
-            const mdFiles = this.app.vault.getMarkdownFiles();
-            for (const file of mdFiles) {
-                if (this.isFileExcluded(file, excludedList)) continue;
-
-                const isIndexed = indexedPaths.has(file.path);
-                let isPending = false;
-                let isUnindexed = false;
-
-                if (isIndexed) {
-                    const regTime = indexedPaths.get(file.path)!;
-                    const fileTime = Math.floor(file.stat.mtime);
-                    if (regTime !== fileTime) {
-                        isPending = true;
-                    }
-                } else {
-                    isUnindexed = true;
-                }
-
-                if (isUnindexed) {
-                    let parent = file.parent;
-                    while (parent && !parent.isRoot()) {
-                        foldersWithUnindexed.add(parent.path);
-                        parent = parent.parent;
-                    }
-                } else if (isPending) {
-                    let parent = file.parent;
-                    while (parent && !parent.isRoot()) {
-                        foldersWithPending.add(parent.path);
-                        parent = parent.parent;
-                    }
-                }
-            }
-
-            const fileExplorerLeaves = this.app.workspace.getLeavesOfType('file-explorer');
-            for (const leaf of fileExplorerLeaves) {
-                const fileItems = (leaf.view as any)?.fileItems;
-                if (!fileItems) continue;
-                
-                for (const path in fileItems) {
-                    const item = fileItems[path];
-                    const file = item?.file;
-                    if (!file) continue;
-                    
-                    const el = (item.selfEl || item.innerEl || item.titleEl || item.el) as HTMLElement | undefined;
-                    if (!el) continue;
-
-                    // Clean up any legacy injected span elements
-                    const legacySpan = el.querySelector?.('.embedding-indicator');
-                    if (legacySpan) legacySpan.remove();
-
-                    if (file instanceof TFile || 'extension' in file) {
-                        if ((file as TFile).extension !== 'md' || this.isFileExcluded(file as TFile, excludedList)) {
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
-                            continue;
-                        }
-
-                        const isIndexed = indexedPaths.has(file.path);
-                        let shouldBePending = false;
-                        let shouldBeUnindexed = false;
-
-                        if (isIndexed) {
-                            const regTime = indexedPaths.get(file.path)!;
-                            const fileTime = Math.floor(file.stat.mtime);
-                            if (regTime !== fileTime) {
-                                shouldBePending = true;
-                            }
-                        } else {
-                            shouldBeUnindexed = true;
-                        }
-
-                        if (shouldBePending) {
-                            if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
-                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                        } else if (shouldBeUnindexed) {
-                            if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
-                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                        } else {
-                            // Indexed and up to date -> no color/badge
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
-                        }
-                    } else if (file instanceof TFolder || 'children' in file) {
-                        if (file.path === '/' || (file.isRoot && file.isRoot()) || this.isPathExcluded(file.path, excludedList)) {
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
-                            continue;
-                        }
-
-                        const isCollapsed = Boolean(
-                            item.collapsed ||
-                            item.el?.classList?.contains('is-collapsed') ||
-                            item.selfEl?.classList?.contains('is-collapsed')
-                        );
-
-                        let shouldBePending = false;
-                        let shouldBeUnindexed = false;
-
-                        if (isCollapsed) {
-                            if (foldersWithUnindexed.has(file.path)) {
-                                shouldBeUnindexed = true;
-                            } else if (foldersWithPending.has(file.path)) {
-                                shouldBePending = true;
-                            }
-                        }
-
-                        if (shouldBeUnindexed) {
-                            if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
-                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                        } else if (shouldBePending) {
-                            if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
-                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                        } else {
-                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
-                        }
-                    }
-                }
-            }
-        }, 100);
-    }
-
     async updateFileStatus(file: TFile | null) {
         let targetFile = file;
         if (!targetFile) {
@@ -557,7 +308,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
         try {
             const reg = this.dbManager.state.registry[targetFile.path];
-            
+
             if (reg) {
                 if (Math.floor(Number(reg.mtime)) === Math.floor(targetFile.stat.mtime)) {
                     this.fileStatusItem.setText('🧠 Indexed');
@@ -578,62 +329,26 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
     async activateView() {
         const { workspace } = this.app;
-        
         let leaf: WorkspaceLeaf | null = null;
         const leaves = workspace.getLeavesOfType(SIMILAR_NOTES_VIEW_TYPE);
-        
+
         if (leaves.length > 0) {
-            // A leaf with our view already exists, use that
             leaf = leaves[0]!;
         } else {
-            // Our view could not be found in the workspace, create a new leaf
-            // as a split
             leaf = workspace.getLeaf('split');
             if (leaf) {
                 await leaf.setViewState({ type: SIMILAR_NOTES_VIEW_TYPE, active: true });
             }
         }
-        
+
         if (leaf) {
-            // "Reveal" the leaf in case it is in a collapsed sidebar
             workspace.revealLeaf(leaf);
         }
     }
 
-    cleanupProcess() {
-        if (this.onLaunchProcess && this.onLaunchProcess.pid) {
-            if (process.platform === 'win32') {
-                try {
-                    execSync(`taskkill /pid ${this.onLaunchProcess.pid} /T /F`);
-                } catch (e) {
-                    console.error("Failed to kill process tree", e);
-                }
-            } else {
-                this.onLaunchProcess.kill();
-            }
-            this.onLaunchProcess = null;
-        }
-    }
-
     async onunload() {
-        this.cleanupProcess();
-        for (const obs of this.fileExplorerObservers) {
-            obs.disconnect();
-        }
-        this.fileExplorerObservers = [];
-
-        // Remove indicator classes from explorer
-        const leaves = this.app.workspace.getLeavesOfType('file-explorer');
-        for (const leaf of leaves) {
-            const fileItems = (leaf.view as any)?.fileItems;
-            if (!fileItems) continue;
-            for (const path in fileItems) {
-                const el = (fileItems[path]?.selfEl || fileItems[path]?.el) as HTMLElement | undefined;
-                if (el) {
-                    el.classList.remove('embedding-indexed', 'embedding-pending', 'embedding-unindexed');
-                }
-            }
-        }
+        this.serverProcessManager.stop();
+        this.fileExplorerManager.cleanup();
 
         if (this.api) {
             this.api.stop();
