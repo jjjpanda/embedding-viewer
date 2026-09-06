@@ -1,4 +1,4 @@
-import { Plugin, Notice, MarkdownView, WorkspaceLeaf, Menu, TFile, setIcon } from 'obsidian';
+import { Plugin, Notice, MarkdownView, WorkspaceLeaf, Menu, TFile, TFolder, setIcon } from 'obsidian';
 import { DatabaseManager } from './db';
 import { Indexer } from './indexer';
 import { QueryService } from './query';
@@ -63,16 +63,9 @@ export default class EmbeddingViewerPlugin extends Plugin {
         const scheduleIndex = (file: any, eventName: string) => {
             if (file.extension !== 'md') return;
 
-            const excluded = this.settings.excludedFolders
-                .split('\n')
-                .map((f: string) => f.trim())
-                .filter((f: string) => f.length > 0);
-
-            for (const ex of excluded) {
-                if (file.path.startsWith(ex)) {
-                    this.indexer.deleteFile(file.path);
-                    return;
-                }
+            if (this.isFileExcluded(file)) {
+                this.indexer.deleteFile(file.path);
+                return;
             }
 
             if (indexDebouncers.has(file.path)) {
@@ -314,6 +307,46 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
     }
 
+    getExcludedFolders(): string[] {
+        if (!this.settings.excludedFolders) return [];
+        return this.settings.excludedFolders
+            .split('\n')
+            .map((f: string) => f.trim().replace(/^(\.\/|\/)+/, '').replace(/\/+$/, ''))
+            .filter((f: string) => f.length > 0);
+    }
+
+    isPathExcluded(path: string, excludedList?: string[]): boolean {
+        if (path === 'profiler.md' || path.endsWith('/profiler.md')) {
+            return true;
+        }
+
+        const excluded = excludedList ?? this.getExcludedFolders();
+        if (excluded.length === 0) return false;
+
+        const normalizedPath = path.replace(/^(\.\/|\/)+/, '').replace(/\/+$/, '');
+
+        for (const ex of excluded) {
+            if (normalizedPath === ex || normalizedPath.startsWith(ex + '/')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    isFileExcluded(file: TFile, excludedList?: string[]): boolean {
+        if (this.isPathExcluded(file.path, excludedList)) {
+            return true;
+        }
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        if (cache?.frontmatter?.['exclude_embedding'] === true) {
+            return true;
+        }
+
+        return false;
+    }
+
     private fileExplorerObservers: MutationObserver[] = [];
     private updateFileExplorerTimeout: number | null = null;
 
@@ -327,8 +360,32 @@ export default class EmbeddingViewerPlugin extends Plugin {
         for (const leaf of leaves) {
             const container = (leaf.view as any)?.containerEl;
             if (!container) continue;
-            const obs = new MutationObserver(() => this.updateFileExplorer());
-            obs.observe(container, { childList: true, subtree: true });
+            const obs = new MutationObserver((mutations) => {
+                const hasRelevantMutation = mutations.some((m) => {
+                    if (m.type === 'childList') return true;
+                    if (m.type === 'attributes' && m.attributeName === 'class') {
+                        const target = m.target as HTMLElement;
+                        const oldClass = m.oldValue || '';
+                        const currentClass = target.className || '';
+                        const wasCollapsed = oldClass.includes('is-collapsed');
+                        const isCollapsed = currentClass.includes('is-collapsed');
+                        if (wasCollapsed !== isCollapsed) return true;
+                        const stripOurClasses = (s: string) => s.replace(/embedding-(unindexed|pending|indexed)/g, '').trim();
+                        return stripOurClasses(oldClass) !== stripOurClasses(currentClass);
+                    }
+                    return false;
+                });
+                if (hasRelevantMutation) {
+                    this.updateFileExplorer();
+                }
+            });
+            obs.observe(container, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['class'],
+                attributeOldValue: true,
+            });
             this.fileExplorerObservers.push(obs);
         }
     }
@@ -345,6 +402,43 @@ export default class EmbeddingViewerPlugin extends Plugin {
                 indexedPaths.set(p, registry[p]!.mtime);
             }
 
+            const excludedList = this.getExcludedFolders();
+            const foldersWithUnindexed = new Set<string>();
+            const foldersWithPending = new Set<string>();
+
+            const mdFiles = this.app.vault.getMarkdownFiles();
+            for (const file of mdFiles) {
+                if (this.isFileExcluded(file, excludedList)) continue;
+
+                const isIndexed = indexedPaths.has(file.path);
+                let isPending = false;
+                let isUnindexed = false;
+
+                if (isIndexed) {
+                    const regTime = indexedPaths.get(file.path)!;
+                    const fileTime = Math.floor(file.stat.mtime);
+                    if (regTime !== fileTime) {
+                        isPending = true;
+                    }
+                } else {
+                    isUnindexed = true;
+                }
+
+                if (isUnindexed) {
+                    let parent = file.parent;
+                    while (parent && !parent.isRoot()) {
+                        foldersWithUnindexed.add(parent.path);
+                        parent = parent.parent;
+                    }
+                } else if (isPending) {
+                    let parent = file.parent;
+                    while (parent && !parent.isRoot()) {
+                        foldersWithPending.add(parent.path);
+                        parent = parent.parent;
+                    }
+                }
+            }
+
             const fileExplorerLeaves = this.app.workspace.getLeavesOfType('file-explorer');
             for (const leaf of fileExplorerLeaves) {
                 const fileItems = (leaf.view as any)?.fileItems;
@@ -353,7 +447,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
                 for (const path in fileItems) {
                     const item = fileItems[path];
                     const file = item?.file;
-                    if (!file || file.extension !== 'md') continue;
+                    if (!file) continue;
                     
                     const el = (item.selfEl || item.innerEl || item.titleEl || item.el) as HTMLElement | undefined;
                     if (!el) continue;
@@ -362,33 +456,80 @@ export default class EmbeddingViewerPlugin extends Plugin {
                     const legacySpan = el.querySelector?.('.embedding-indicator');
                     if (legacySpan) legacySpan.remove();
 
-                    const isIndexed = indexedPaths.has(file.path);
-                    let shouldBePending = false;
-                    let shouldBeUnindexed = false;
-
-                    if (isIndexed) {
-                        const regTime = indexedPaths.get(file.path)!;
-                        const fileTime = Math.floor(file.stat.mtime);
-                        if (regTime !== fileTime) {
-                            shouldBePending = true;
+                    if (file instanceof TFile || 'extension' in file) {
+                        if ((file as TFile).extension !== 'md' || this.isFileExcluded(file as TFile, excludedList)) {
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            continue;
                         }
-                    } else {
-                        shouldBeUnindexed = true;
-                    }
 
-                    if (shouldBePending) {
-                        if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
-                        if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
-                        if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                    } else if (shouldBeUnindexed) {
-                        if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
-                        if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                        if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                    } else {
-                        // Indexed and up to date -> no color/badge
-                        if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
-                        if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
-                        if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                        const isIndexed = indexedPaths.has(file.path);
+                        let shouldBePending = false;
+                        let shouldBeUnindexed = false;
+
+                        if (isIndexed) {
+                            const regTime = indexedPaths.get(file.path)!;
+                            const fileTime = Math.floor(file.stat.mtime);
+                            if (regTime !== fileTime) {
+                                shouldBePending = true;
+                            }
+                        } else {
+                            shouldBeUnindexed = true;
+                        }
+
+                        if (shouldBePending) {
+                            if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else if (shouldBeUnindexed) {
+                            if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else {
+                            // Indexed and up to date -> no color/badge
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                        }
+                    } else if (file instanceof TFolder || 'children' in file) {
+                        if (file.path === '/' || (file.isRoot && file.isRoot()) || this.isPathExcluded(file.path, excludedList)) {
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            continue;
+                        }
+
+                        const isCollapsed = Boolean(
+                            item.collapsed ||
+                            item.el?.classList?.contains('is-collapsed') ||
+                            item.selfEl?.classList?.contains('is-collapsed')
+                        );
+
+                        let shouldBePending = false;
+                        let shouldBeUnindexed = false;
+
+                        if (isCollapsed) {
+                            if (foldersWithUnindexed.has(file.path)) {
+                                shouldBeUnindexed = true;
+                            } else if (foldersWithPending.has(file.path)) {
+                                shouldBePending = true;
+                            }
+                        }
+
+                        if (shouldBeUnindexed) {
+                            if (!el.classList.contains('embedding-unindexed')) el.classList.add('embedding-unindexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else if (shouldBePending) {
+                            if (!el.classList.contains('embedding-pending')) el.classList.add('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                        } else {
+                            if (el.classList.contains('embedding-indexed')) el.classList.remove('embedding-indexed');
+                            if (el.classList.contains('embedding-pending')) el.classList.remove('embedding-pending');
+                            if (el.classList.contains('embedding-unindexed')) el.classList.remove('embedding-unindexed');
+                        }
                     }
                 }
             }
@@ -403,6 +544,14 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
         if (!targetFile || targetFile.extension !== 'md') {
             if (this.fileStatusItem) this.fileStatusItem.setText('');
+            return;
+        }
+
+        if (this.isFileExcluded(targetFile)) {
+            if (this.fileStatusItem) {
+                this.fileStatusItem.setText('🧠 Excluded');
+                this.fileStatusItem.setAttribute('aria-label', 'This file is excluded from embedding index');
+            }
             return;
         }
 

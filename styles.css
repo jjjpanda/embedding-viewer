@@ -115,6 +115,7 @@
 }
 
 .nav-file-title.embedding-pending::after,
+.nav-folder-title.embedding-pending::after,
 .tree-item-self.embedding-pending::after {
     content: '';
     display: inline-block;
@@ -130,6 +131,7 @@
 }
 
 .nav-file-title.embedding-unindexed::after,
+.nav-folder-title.embedding-unindexed::after,
 .tree-item-self.embedding-unindexed::after {
     content: '';
     display: inline-block;

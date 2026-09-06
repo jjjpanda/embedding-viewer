@@ -194,6 +194,11 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                 .onChange(async (value) => {
                     this.plugin.settings.excludedFolders = value;
                     await this.plugin.saveSettings();
+                    this.plugin.updateFileExplorer();
+                    const activeFile = this.plugin.app.workspace.getActiveFile();
+                    if (activeFile) {
+                        this.plugin.updateFileStatus(activeFile);
+                    }
                 }));
 
         new Setting(containerEl)

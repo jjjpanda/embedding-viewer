@@ -229,12 +229,7 @@ export class Indexer {
 
     public async queueFileForIndex(file: TFile) {
         if (file.extension !== 'md') return;
-        if (this.plugin.settings.excludedFolders) {
-            const excluded = this.plugin.settings.excludedFolders.split('\n').map(f => f.trim()).filter(f => f.length > 0);
-            for (const ex of excluded) {
-                if (file.path.startsWith(ex)) return;
-            }
-        }
+        if (this.plugin.isFileExcluded(file)) return;
         
         if (!this.fileIndexQueue.find(f => f.path === file.path)) {
             this.fileIndexQueue.push(file);
@@ -379,18 +374,7 @@ export class Indexer {
             }
 
             const allFiles = this.app.vault.getMarkdownFiles();
-            const excluded = this.plugin.settings.excludedFolders
-                .split('\n')
-                .map(f => f.trim())
-                .filter(f => f.length > 0);
-
-            const files = allFiles.filter(f => {
-                if (f.name === 'profiler.md' || f.path === 'profiler.md') return false;
-                for (const ex of excluded) {
-                    if (f.path.startsWith(ex)) return false;
-                }
-                return true;
-            });
+            const files = allFiles.filter(f => !this.plugin.isFileExcluded(f));
 
             const currentPaths = new Set(files.map(f => f.path));
             let pathsToDelete: string[] = [];
