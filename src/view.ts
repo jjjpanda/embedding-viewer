@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, MarkdownView } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownView, TFile } from 'obsidian';
 import EmbeddingViewerPlugin from './main';
 import { ChunkMatchGroup, QueryResult } from './query';
 
@@ -81,11 +81,39 @@ export class SimilarNotesView extends ItemView {
             return;
         }
 
-        container.createEl('h3', { text: 'Loading similar notes...' });
-        
         try {
             const path = this.activeFile;
             
+            const tfile = this.app.vault.getAbstractFileByPath(path);
+            if (tfile instanceof TFile && this.plugin.isFileExcluded(tfile)) {
+                const p = container.createEl('p', { text: 'This note is excluded from embeddings.' });
+                p.style.color = 'var(--text-muted)';
+                return;
+            }
+
+            if (!this.plugin.dbManager.state.registry[path]) {
+                const p = container.createEl('p', { text: 'This note has not been indexed yet.' });
+                p.style.color = 'var(--text-muted)';
+                if (tfile instanceof TFile) {
+                    const btn = container.createEl('button', { text: 'Index this note now' });
+                    btn.style.marginTop = '8px';
+                    btn.onclick = async () => {
+                        btn.disabled = true;
+                        btn.setText('Indexing...');
+                        try {
+                            await this.plugin.indexer.queueFileForIndex(tfile, true);
+                        } catch (e) {
+                            console.error('Failed to index file from view:', e);
+                        } finally {
+                            this.updateView();
+                        }
+                    };
+                }
+                return;
+            }
+
+            container.createEl('h3', { text: 'Loading similar notes...' });
+
             // Fetch chunk-level matches
             const chunkGroups = await this.plugin.queryService.findSimilarPerChunk(path, 3, 4);
             
@@ -94,7 +122,8 @@ export class SimilarNotesView extends ItemView {
             container.empty();
 
             if (!chunkGroups || chunkGroups.length === 0) {
-                const p = container.createEl('p', { text: 'No similar snippets found.' });
+                const minScore = Math.round((this.plugin.settings.minimumSimilarity ?? 0.6) * 100);
+                const p = container.createEl('p', { text: `No similar snippets found above ${minScore}% similarity.` });
                 p.style.color = 'var(--text-muted)';
                 return;
             }
@@ -152,12 +181,17 @@ export class SimilarNotesView extends ItemView {
                     link.style.textDecoration = 'none';
                     link.onclick = async (e) => {
                         e.preventDefault();
-                        const file = this.app.metadataCache.getFirstLinkpathDest(res.path, '');
-                        if (file) {
-                            const leaf = this.app.workspace.getLeaf(true);
+                        const file = this.app.vault.getAbstractFileByPath(res.path);
+                        const isMod = e.ctrlKey || e.metaKey;
+                        if (file instanceof TFile) {
+                            let leaf = this.app.workspace.getLeaf(isMod ? 'tab' : false);
+                            if (leaf.getRoot() !== this.app.workspace.rootSplit) {
+                                const rootLeaf = this.app.workspace.getMostRecentLeaf(this.app.workspace.rootSplit);
+                                leaf = isMod ? this.app.workspace.getLeaf('tab') : (rootLeaf || this.app.workspace.getLeaf('tab'));
+                            }
                             await leaf.openFile(file, { eState: { line: res.startLine } });
                         } else {
-                            await this.app.workspace.openLinkText(res.path, '', true);
+                            await this.app.workspace.openLinkText(res.path, '', isMod);
                         }
                     };
 

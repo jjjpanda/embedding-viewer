@@ -1,4 +1,4 @@
-import { Plugin, Notice, MarkdownView, WorkspaceLeaf, TFile } from 'obsidian';
+import { Plugin, Notice, MarkdownView, WorkspaceLeaf, TFile, Menu } from 'obsidian';
 import { DatabaseManager } from './db';
 import { Indexer } from './indexer';
 import { QueryService } from './query';
@@ -6,6 +6,7 @@ import { SimilarNotesView, SIMILAR_NOTES_VIEW_TYPE } from './view';
 import { createChunkVisualizer, toggleVisualizerEffect } from './visualize-chunks';
 import { EmbeddingViewerSettings, DEFAULT_SETTINGS, EmbeddingViewerSettingTab } from './settings';
 import { SimilarityModal } from './modal';
+import { SemanticSearchModal } from './search-modal';
 import { LocalApi } from './api';
 import { ServerProcessManager } from './server-process';
 import { FileExplorerManager } from './file-explorer';
@@ -21,7 +22,6 @@ export default class EmbeddingViewerPlugin extends Plugin {
     fileExplorerManager!: FileExplorerManager;
     visualizerActive: boolean = false;
     statusBarItem!: HTMLElement;
-    fileStatusItem!: HTMLElement;
 
     async onload() {
         await this.loadSettings();
@@ -110,18 +110,69 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
         setupReadModeHover(this.app, this);
 
+        this.statusBarItem = this.addStatusBarItem();
+        this.statusBarItem.addClass('mod-clickable');
+        this.statusBarItem.setText('🧠 Booting DB...');
+        this.registerDomEvent(this.statusBarItem, 'click', (e: MouseEvent) => {
+            const isMod = e.ctrlKey || e.metaKey;
+            const activeFile = this.app.workspace.getActiveViewOfType(MarkdownView)?.file;
+            if (isMod || !activeFile || activeFile.extension !== 'md') {
+                new SemanticSearchModal(this.app, this).open();
+                return;
+            }
+            if (this.isFileExcluded(activeFile)) {
+                new Notice(`${activeFile.basename} is excluded from embedding index.`);
+            } else {
+                new Notice(`Reindexing ${activeFile.basename}...`);
+                this.indexer.queueFileForIndex(activeFile, true);
+            }
+        });
+
+        this.registerDomEvent(this.statusBarItem, 'contextmenu', (e: MouseEvent) => {
+            e.preventDefault();
+            const menu = new Menu();
+            menu.addItem((item) => {
+                item
+                    .setTitle('Semantic search vault')
+                    .setIcon('search')
+                    .onClick(() => {
+                        new SemanticSearchModal(this.app, this).open();
+                    });
+            });
+
+            const activeFile = this.app.workspace.getActiveViewOfType(MarkdownView)?.file;
+            if (activeFile && activeFile.extension === 'md' && !this.isFileExcluded(activeFile)) {
+                menu.addItem((item) => {
+                    item
+                        .setTitle(`Reindex ${activeFile.basename}`)
+                        .setIcon('refresh-cw')
+                        .onClick(() => {
+                            new Notice(`Reindexing ${activeFile.basename}...`);
+                            this.indexer.queueFileForIndex(activeFile, true);
+                        });
+                });
+            }
+
+            menu.addItem((item) => {
+                item
+                    .setTitle('Rebuild vault index')
+                    .setIcon('layers')
+                    .onClick(async () => {
+                        await this.indexer.rebuildIndex((msg) => {
+                            this.updateFileStatus(null, msg || undefined);
+                        });
+                    });
+            });
+
+            menu.showAtMouseEvent(e);
+        });
+
         this.api = new LocalApi(this);
         if (this.settings.enableApi) {
             this.api.start();
         }
 
         this.addSettingTab(new EmbeddingViewerSettingTab(this.app, this));
-
-        this.statusBarItem = this.addStatusBarItem();
-        this.statusBarItem.setText('');
-
-        this.fileStatusItem = this.addStatusBarItem();
-        this.fileStatusItem.setText('🧠 Booting DB...');
 
         this.registerEvent(
             this.app.workspace.on('file-open', (file) => {
@@ -158,6 +209,14 @@ export default class EmbeddingViewerPlugin extends Plugin {
         });
 
         this.addCommand({
+            id: 'semantic-search-vault',
+            name: 'Semantic search vault',
+            callback: () => {
+                new SemanticSearchModal(this.app, this).open();
+            }
+        });
+
+        this.addCommand({
             id: 'toggle-chunk-visualizer',
             name: 'Toggle Chunk Visualizer',
             callback: () => {
@@ -183,7 +242,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             name: 'Rebuild vault index',
             callback: async () => {
                 await this.indexer.rebuildIndex((msg) => {
-                    this.statusBarItem.setText(msg === null ? '' : `🧠 ${msg}`);
+                    this.updateFileStatus(null, msg || undefined);
                 });
             },
         });
@@ -193,7 +252,7 @@ export default class EmbeddingViewerPlugin extends Plugin {
             name: 'Force rebuild vault index',
             callback: async () => {
                 await this.indexer.rebuildIndex((msg) => {
-                    this.statusBarItem.setText(msg === null ? '' : `🧠 ${msg}`);
+                    this.updateFileStatus(null, msg || undefined);
                 }, true);
             },
         });
@@ -247,6 +306,15 @@ export default class EmbeddingViewerPlugin extends Plugin {
         this.fileExplorerManager.updateFileExplorer();
     }
 
+    refreshSimilarViews() {
+        const leaves = this.app.workspace.getLeavesOfType(SIMILAR_NOTES_VIEW_TYPE);
+        for (const leaf of leaves) {
+            if (leaf.view instanceof SimilarNotesView) {
+                leaf.view.updateView();
+            }
+        }
+    }
+
     getExcludedFolders(): string[] {
         if (!this.settings.excludedFolders) return [];
         return this.settings.excludedFolders
@@ -287,22 +355,31 @@ export default class EmbeddingViewerPlugin extends Plugin {
         return false;
     }
 
-    async updateFileStatus(file: TFile | null) {
+    async updateFileStatus(file?: TFile | null, indexingMessage?: string) {
+        if (!this.statusBarItem) return;
+
+        if (indexingMessage) {
+            this.statusBarItem.setText(`🧠 ${indexingMessage}`);
+            this.statusBarItem.setAttribute('aria-label', `Embedding Viewer: ${indexingMessage}`);
+            return;
+        }
+
         let targetFile = file;
-        if (!targetFile) {
+        if (targetFile === undefined) {
             targetFile = this.app.workspace.getActiveViewOfType(MarkdownView)?.file || null;
         }
 
+        const apiSuffix = this.api?.isRunning() ? ` | API: Port ${this.settings.apiPort || 27123}` : '';
+
         if (!targetFile || targetFile.extension !== 'md') {
-            if (this.fileStatusItem) this.fileStatusItem.setText('');
+            this.statusBarItem.setText('🧠 Ready');
+            this.statusBarItem.setAttribute('aria-label', `Embedding Viewer Ready${apiSuffix} | Click to search`);
             return;
         }
 
         if (this.isFileExcluded(targetFile)) {
-            if (this.fileStatusItem) {
-                this.fileStatusItem.setText('🧠 Excluded');
-                this.fileStatusItem.setAttribute('aria-label', 'This file is excluded from embedding index');
-            }
+            this.statusBarItem.setText('🧠 Excluded');
+            this.statusBarItem.setAttribute('aria-label', `${targetFile.basename}: Excluded from embedding index${apiSuffix} | Click to search`);
             return;
         }
 
@@ -311,19 +388,19 @@ export default class EmbeddingViewerPlugin extends Plugin {
 
             if (reg) {
                 if (Math.floor(Number(reg.mtime)) === Math.floor(targetFile.stat.mtime)) {
-                    this.fileStatusItem.setText('🧠 Indexed');
-                    this.fileStatusItem.setAttribute('aria-label', 'This file is in the embedding index and up to date');
+                    this.statusBarItem.setText('🧠 Indexed');
+                    this.statusBarItem.setAttribute('aria-label', `${targetFile.basename}: Indexed and up to date${apiSuffix} | Click to reindex, Ctrl+Click / Right-click for menu`);
                 } else {
-                    this.fileStatusItem.setText('🧠 Pending Update');
-                    this.fileStatusItem.setAttribute('aria-label', 'This file has changes waiting to be indexed');
+                    this.statusBarItem.setText('🧠 Pending Update');
+                    this.statusBarItem.setAttribute('aria-label', `${targetFile.basename}: Changes waiting to be indexed${apiSuffix} | Click to index now, Ctrl+Click / Right-click for menu`);
                 }
             } else {
-                this.fileStatusItem.setText('🧠 Unindexed');
-                this.fileStatusItem.setAttribute('aria-label', 'This file is not indexed');
+                this.statusBarItem.setText('🧠 Unindexed');
+                this.statusBarItem.setAttribute('aria-label', `${targetFile.basename}: Not indexed${apiSuffix} | Click to index now, Ctrl+Click / Right-click for menu`);
             }
         } catch (error) {
             console.error('[Embedding Viewer] updateFileStatus error:', error);
-            this.fileStatusItem.setText('🧠 DB Error');
+            this.statusBarItem.setText('🧠 DB Error');
         }
     }
 

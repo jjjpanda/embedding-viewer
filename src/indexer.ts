@@ -1,14 +1,9 @@
 import { Notice, TFile, App } from 'obsidian';
-import { DatabaseManager, ChunkRecord, FileRegistryRecord } from './db';
+import { DatabaseManager } from './db';
 import EmbeddingViewerPlugin from './main';
+import { Chunk, MarkdownChunker } from './chunker';
 
-export interface Chunk {
-    embedText: string;
-    content: string;
-    startLine: number;
-    endLine: number;
-    heading: string | null;
-}
+export type { Chunk };
 
 export class Indexer {
     private isIndexing = false;
@@ -18,7 +13,9 @@ export class Indexer {
     private model: string;
     
     private fileIndexQueue: TFile[] = [];
+    private forceIndexPaths = new Set<string>();
     private isProcessingQueue = false;
+    private activeQueuePromise: Promise<void> | null = null;
 
     constructor(private app: App, private dbManager: DatabaseManager, private plugin: EmbeddingViewerPlugin) {
         this.maxChunkSize = this.plugin.settings.chunkSize || 500;
@@ -63,160 +60,13 @@ export class Indexer {
     }
 
     public stripWikilinks(text: string): string {
-        let stripped = text.replace(/!\[\[(.*?)\]\]/g, '$1');
-        stripped = stripped.replace(/\[\[(.*?)\]\]/g, (match, p1) => {
-            const parts = p1.split('|');
-            return parts.length > 1 ? parts[1] : parts[0];
-        });
-        return stripped;
-    }
-
-    private getFrontmatterLineCount(content: string): number {
-        const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
-        return m ? m[0].split(/\r?\n/).length - 1 : 0;
-    }
-
-    private buildHeadingMap(lines: string[]): Record<number, { hierarchy: string, mostRecent: string | null }> {
-        const headingMap: Record<number, { hierarchy: string, mostRecent: string | null }> = {};
-        const headingStack: { level: number, text: string }[] = [];
-        
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i] || '';
-            const match = line.match(/^(#{1,6})\s+(.+)$/);
-            if (match && match[1] && match[2]) {
-                const level = match[1].length;
-                const text = match[2];
-                while (headingStack.length > 0 && headingStack[headingStack.length - 1]!.level >= level) {
-                    headingStack.pop();
-                }
-                headingStack.push({ level, text });
-            }
-            headingMap[i] = {
-                hierarchy: headingStack.length > 0 ? 'Hierarchy: ' + headingStack.map(h => h.text).join(' > ') : '',
-                mostRecent: headingStack.length > 0 ? headingStack[headingStack.length - 1]!.text : null
-            };
-        }
-        return headingMap;
-    }
-
-    private recursiveSplit(text: string, maxLen: number): string[] {
-        if (text.length <= maxLen) return [text];
-        const res: string[] = [];
-        const lines = text.split('\n');
-        let current = '';
-        for (const line of lines) {
-            if ((current.length + line.length + 1) > maxLen && current.length > 0) {
-                res.push(current.trim());
-                current = line + '\n';
-            } else {
-                current += line + '\n';
-            }
-        }
-        if (current.trim().length > 0) {
-            res.push(current.trim());
-        }
-        return res;
+        return MarkdownChunker.stripWikilinks(text);
     }
 
     public extractChunks(content: string, file: TFile, excludedPhrases: string[] = []): Chunk[] {
         const cache = this.app.metadataCache.getFileCache(file);
-        if (cache?.frontmatter?.['exclude_embedding'] === true) return [];
-
-        const chunks: Chunk[] = [];
-        const lines = content.split(/\r?\n/);
-        const fmLineCount = this.getFrontmatterLineCount(content);
-        const headingMap = this.buildHeadingMap(lines);
-
-        const bodyText = lines.slice(fmLineCount).join('\n').trim();
-        if (!bodyText) return [];
-
-        const pieces: string[] = [];
-        const codeBlockRegex = /(?:```|~~~)[\s\S]*?(?:```|~~~)/g;
-        let lastIndex = 0;
-        let matchCb;
-        while ((matchCb = codeBlockRegex.exec(bodyText)) !== null) {
-            const textBefore = bodyText.substring(lastIndex, matchCb.index).trim();
-            if (textBefore) {
-                pieces.push(...this.recursiveSplit(textBefore, this.maxChunkSize));
-            }
-            const codeBlockStr = matchCb[0];
-            if (codeBlockStr.length > this.maxChunkSize) {
-                const delimiter = codeBlockStr.startsWith('~~~') ? '~~~' : '```';
-                const cbLines = codeBlockStr.split('\n');
-                let curCbChunk = cbLines[0] + '\n';
-                for (let i = 1; i < cbLines.length - 1; i++) {
-                    const lineStr = cbLines[i] + '\n';
-                    if ((curCbChunk.length + lineStr.length + delimiter.length) > this.maxChunkSize && curCbChunk.split('\n').length > 2) {
-                        curCbChunk += delimiter;
-                        pieces.push(curCbChunk);
-                        curCbChunk = delimiter + '\n' + lineStr;
-                    } else {
-                        curCbChunk += lineStr;
-                    }
-                }
-                curCbChunk += cbLines[cbLines.length - 1];
-                pieces.push(curCbChunk);
-            } else {
-                pieces.push(codeBlockStr);
-            }
-            lastIndex = codeBlockRegex.lastIndex;
-        }
-        const textAfter = bodyText.substring(lastIndex).trim();
-        if (textAfter) {
-            pieces.push(...this.recursiveSplit(textAfter, this.maxChunkSize));
-        }
-
-        let currentSearchPos = 0;
-        const searchContent = content.replace(/\r\n/g, '\n');
-        
-        for (const piece of pieces) {
-            const trimmedPiece = piece.trim();
-            if (!trimmedPiece) continue;
-            
-            const isCodeBlock = (trimmedPiece.startsWith('```') && trimmedPiece.endsWith('```')) || 
-                                (trimmedPiece.startsWith('~~~') && trimmedPiece.endsWith('~~~'));
-            if (!isCodeBlock) {
-                const wordCount = trimmedPiece.split(/\s+/).filter(w => w.length > 0).length;
-                if (wordCount < 8) continue;
-            }
-            
-            const chunkIndex = searchContent.indexOf(piece, currentSearchPos);
-            let startLine = 0;
-            if (chunkIndex !== -1) {
-                const textBefore = searchContent.substring(0, chunkIndex);
-                startLine = textBefore.split('\n').length - 1;
-                currentSearchPos = chunkIndex + piece.length;
-            } else {
-                startLine = fmLineCount;
-            }
-            
-            const headingInfo = headingMap[startLine] || { hierarchy: '', mostRecent: null };
-            let finalPieceText = this.stripWikilinks(piece);
-            let filteredHierarchy = this.stripWikilinks(headingInfo.hierarchy);
-            const excludeSet = new Set(excludedPhrases);
-            
-            if (!isCodeBlock) {
-                finalPieceText = finalPieceText.split(/\r?\n/)
-                    .filter(line => !excludeSet.has(line.trim().toLowerCase()))
-                    .join('\n');
-            }
-                
-            filteredHierarchy = filteredHierarchy.split(/\r?\n/)
-                .filter(line => !excludeSet.has(line.trim().toLowerCase()))
-                .join('\n');
-            
-            const embedText = (filteredHierarchy ? `${filteredHierarchy}\n\n` : '') + finalPieceText;
-            
-            chunks.push({
-                embedText,
-                content: finalPieceText.trim(),
-                startLine,
-                endLine: startLine + piece.split('\n').length - 1,
-                heading: headingInfo.mostRecent
-            });
-        }
-
-        return chunks;
+        const isExcluded = cache?.frontmatter?.['exclude_embedding'] === true;
+        return MarkdownChunker.extractChunks(content, this.maxChunkSize, excludedPhrases, isExcluded);
     }
 
     public async deleteFile(path: string) {
@@ -227,16 +77,27 @@ export class Indexer {
         await this.dbManager.saveDb();
     }
 
-    public async queueFileForIndex(file: TFile) {
+    public async queueFileForIndex(file: TFile, force: boolean = false): Promise<void> {
         if (file.extension !== 'md') return;
         if (this.plugin.isFileExcluded(file)) return;
         
+        if (force) {
+            this.forceIndexPaths.add(file.path);
+        }
+
         if (!this.fileIndexQueue.find(f => f.path === file.path)) {
             this.fileIndexQueue.push(file);
         }
         
         if (this.isIndexing) return;
-        this.processQueue();
+        while (this.fileIndexQueue.length > 0) {
+            if (!this.activeQueuePromise) {
+                this.activeQueuePromise = this.processQueue().finally(() => {
+                    this.activeQueuePromise = null;
+                });
+            }
+            await this.activeQueuePromise;
+        }
     }
 
     private async processQueue() {
@@ -244,119 +105,138 @@ export class Indexer {
         if (this.isProcessingQueue) return;
         this.isProcessingQueue = true;
 
-        let dimension = 0;
         try {
-            const probeResult = await this.embed(['probe']);
-            dimension = probeResult[0]?.length || 0;
-        } catch (e) {
-            console.error("Probe failed in processQueue:", e);
-            new Notice("Embedding server disconnected. Background indexing paused.");
-            if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
-            this.isProcessingQueue = false;
-            return;
-        }
-
-        let processedCount = 0;
-
-        while (this.fileIndexQueue.length > 0) {
-            if (this.fileIndexQueue.length > (this.plugin.settings.bulkIndexThreshold || 20)) {
-                this.fileIndexQueue = [];
-                this.isProcessingQueue = false;
+            let dimension = 0;
+            try {
+                const probeResult = await this.embed(['probe']);
+                dimension = probeResult[0]?.length || 0;
+            } catch (e) {
+                console.error("Probe failed in processQueue:", e);
+                new Notice("Embedding server disconnected. Background indexing paused.");
                 if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
-                this.rebuildIndex((msg) => {
-                    if (this.plugin.statusBarItem) {
-                        this.plugin.statusBarItem.setText(msg === null ? '' : `🧠 ${msg}`);
-                    }
-                });
+                this.fileIndexQueue = [];
                 return;
             }
 
-            const file = this.fileIndexQueue.shift();
-            if (!file) continue;
+            let processedCount = 0;
 
-            processedCount++;
-
-            try {
-                const content = await this.app.vault.read(file);
-                const contentHash = this.hashString(content);
-                
-                const reg = this.dbManager.state.registry[file.path];
-                if (reg) {
-                    if (reg.hash === contentHash && reg.chunk_size === this.maxChunkSize && reg.prefix === this.prefix) {
-                        if (Math.floor(Number(reg.mtime)) !== Math.floor(file.stat.mtime)) {
-                            reg.mtime = Math.floor(file.stat.mtime);
-                        }
-                        continue;
-                    }
+            while (this.fileIndexQueue.length > 0) {
+                if (this.fileIndexQueue.length > (this.plugin.settings.bulkIndexThreshold || 20)) {
+                    this.fileIndexQueue = [];
+                    if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
+                    this.rebuildIndex((msg) => {
+                        this.plugin.updateFileStatus(null, msg || undefined);
+                    });
+                    return;
                 }
 
-                if (this.plugin.statusBarItem) {
-                    this.plugin.statusBarItem.setText(`🧠 Indexing ${file.basename}...`);
-                }
+                const file = this.fileIndexQueue.shift();
+                if (!file) continue;
 
-                // Delete old embeddings for this file
-                this.dbManager.state.chunks = this.dbManager.state.chunks.filter(c => c.path !== file.path);
-                
-                const chunks = this.extractChunks(content, file, this.plugin.settings.lastExcludedPhrases);
-                
-                this.dbManager.state.registry[file.path] = {
-                    path: file.path,
-                    mtime: Math.floor(file.stat.mtime),
-                    hash: contentHash,
-                    chunk_size: this.maxChunkSize,
-                    prefix: this.prefix
-                };
+                const isForced = this.forceIndexPaths.has(file.path);
+                this.forceIndexPaths.delete(file.path);
 
-                if (chunks.length === 0) continue;
+                processedCount++;
 
-                const BATCH_SIZE = Math.max(1, this.plugin.settings.batchSize || 50);
-
-                for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-                    const batch = chunks.slice(i, i + BATCH_SIZE);
-                    const embeddings = await this.embed(batch.map(p => {
-                        const text = `${this.prefix}${p.embedText}`;
-                        return text.length > 4000 ? text.substring(0, 4000) : text;
-                    }), dimension);
+                try {
+                    const content = await this.app.vault.read(file);
+                    const contentHash = this.hashString(content);
+                    const hasExclusions = (this.plugin.settings.lastExcludedPhrases || []).length > 0;
+                    const exclusionHash = this.hashString((this.plugin.settings.lastExcludedPhrases || []).join('\n'));
+                    const expectedExclusionHash = hasExclusions ? exclusionHash : '';
                     
-                    for (let j = 0; j < batch.length; j++) {
-                        const p = batch[j] as Chunk;
-                        const emb = embeddings[j];
-                        if (!emb) continue;
-                        
-                        this.dbManager.state.chunks.push({
-                            path: file.path,
-                            mtime: Math.floor(file.stat.mtime),
-                            content: p.content,
-                            model: this.model,
-                            dimension: dimension,
-                            vector: new Float32Array(emb),
-                            metadata: {
-                                startLine: p.startLine, 
-                                endLine: p.endLine, 
-                                heading: p.heading,
-                                chunkSize: this.maxChunkSize,
-                                prefix: this.prefix,
-                                fileHash: contentHash
+                    const reg = this.dbManager.state.registry[file.path];
+                    if (reg && !isForced) {
+                        const currentExclusionHash = reg.excluded_hash || '';
+                        if (reg.hash === contentHash && reg.chunk_size === this.maxChunkSize && reg.prefix === this.prefix && currentExclusionHash === expectedExclusionHash) {
+                            if (Math.floor(Number(reg.mtime)) !== Math.floor(file.stat.mtime)) {
+                                reg.mtime = Math.floor(file.stat.mtime);
                             }
-                        });
+                            continue;
+                        }
                     }
-                    await new Promise(r => window.setTimeout(r, 10)); // yield
-                }
-            } catch (err) {
-                console.error(`Error indexing file ${file.path}:`, err);
-            }
-        } // End of while loop
-        
-        await this.dbManager.saveDb();
 
-        this.isProcessingQueue = false;
-        if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
-        
-        this.plugin.updateFileExplorer();
-        const activeFile = this.app.workspace.getActiveFile();
-        if (activeFile) {
-            this.plugin.updateFileStatus(activeFile);
+                    if (this.plugin.statusBarItem) {
+                        this.plugin.statusBarItem.setText(`🧠 Indexing ${file.basename}...`);
+                    }
+
+                    // Delete old embeddings for this file
+                    this.dbManager.state.chunks = this.dbManager.state.chunks.filter(c => c.path !== file.path);
+                    
+                    const chunks = this.extractChunks(content, file, this.plugin.settings.lastExcludedPhrases);
+                    
+                    this.dbManager.state.registry[file.path] = {
+                        path: file.path,
+                        mtime: Math.floor(file.stat.mtime),
+                        hash: contentHash,
+                        chunk_size: this.maxChunkSize,
+                        prefix: this.prefix,
+                        excluded_hash: expectedExclusionHash
+                    };
+
+                    if (chunks.length === 0) continue;
+
+                    const fileChunks = chunks.map(chunk => ({ file, chunk, contentHash }));
+                    const BATCH_SIZE = Math.max(1, this.plugin.settings.batchSize || 50);
+
+                    for (let i = 0; i < fileChunks.length; i += BATCH_SIZE) {
+                        const batch = fileChunks.slice(i, i + BATCH_SIZE);
+                        await this.storeChunkBatch(batch, dimension);
+                        await new Promise(r => window.setTimeout(r, 10)); // yield
+                    }
+                } catch (err) {
+                    console.error(`Error indexing file ${file.path}:`, err);
+                }
+            } // End of while loop
+            
+            this.dbManager.requestDebouncedSave(10000);
+
+            if (this.plugin.statusBarItem) this.plugin.statusBarItem.setText('');
+            
+            this.plugin.updateFileExplorer();
+            const activeFile = this.app.workspace.getActiveFile();
+            this.plugin.updateFileStatus(activeFile ?? null);
+            this.plugin.refreshSimilarViews();
+        } finally {
+            this.isProcessingQueue = false;
         }
+    }
+
+    public async storeChunkBatch(
+        batch: { file: TFile, chunk: Chunk, contentHash: string }[],
+        dimension: number
+    ): Promise<number> {
+        const embeddings = await this.embed(batch.map(item => {
+            const text = `${this.prefix}${item.chunk.embedText}`;
+            return text.length > 4000 ? text.substring(0, 4000) : text;
+        }), dimension);
+
+        let stored = 0;
+        for (let k = 0; k < batch.length; k++) {
+            const item = batch[k];
+            const emb = embeddings[k];
+            if (!item || !emb) continue;
+
+            const vector = this.dbManager.normalizeVector(new Float32Array(emb));
+            this.dbManager.state.chunks.push({
+                path: item.file.path,
+                mtime: Math.floor(item.file.stat.mtime),
+                content: item.chunk.content,
+                model: this.model,
+                dimension: dimension,
+                vector,
+                metadata: {
+                    startLine: item.chunk.startLine,
+                    endLine: item.chunk.endLine,
+                    heading: item.chunk.heading,
+                    chunkSize: this.maxChunkSize,
+                    prefix: this.prefix,
+                    fileHash: item.contentHash
+                }
+            });
+            stored++;
+        }
+        return stored;
     }
 
     public async rebuildIndex(updateProgress: (msg: string | null) => void, force: boolean = false) {
@@ -388,12 +268,17 @@ export class Indexer {
                 pathsToDelete.forEach(p => delete this.dbManager.state.registry[p]);
             }
 
+            const hasExclusions = (this.plugin.settings.lastExcludedPhrases || []).length > 0;
+            const exclusionHash = this.hashString((this.plugin.settings.lastExcludedPhrases || []).join('\n'));
+            const expectedExclusionHash = hasExclusions ? exclusionHash : '';
             const toIndex: TFile[] = [];
             for (const file of files) {
                 const reg = this.dbManager.state.registry[file.path];
                 if (!reg) {
                     toIndex.push(file);
                 } else if (reg.chunk_size !== this.maxChunkSize || reg.prefix !== this.prefix) {
+                    toIndex.push(file);
+                } else if ((reg.excluded_hash || '') !== expectedExclusionHash) {
                     toIndex.push(file);
                 } else {
                     const mtime = Math.floor(file.stat.mtime);
@@ -463,7 +348,8 @@ export class Indexer {
                     mtime: Math.floor(file.stat.mtime),
                     hash: contentHash,
                     chunk_size: this.maxChunkSize,
-                    prefix: this.prefix
+                    prefix: this.prefix,
+                    excluded_hash: expectedExclusionHash
                 };
 
                 for (const chunk of chunks) {
@@ -474,35 +360,8 @@ export class Indexer {
             for (let j = 0; j < allChunks.length; j += BATCH_SIZE) {
                 updateProgress(`Embedding chunk ${j + 1}/${allChunks.length}...`);
                 const batch = allChunks.slice(j, j + BATCH_SIZE);
-                
-                const embeddings = await this.embed(batch.map(item => {
-                    const text = `${this.prefix}${item.chunk.embedText}`;
-                    return text.length > 4000 ? text.substring(0, 4000) : text;
-                }), dimension);
-                
-                for (let k = 0; k < batch.length; k++) {
-                    const item = batch[k];
-                    const emb = embeddings[k];
-                    if (!item || !emb) continue;
-                    
-                    this.dbManager.state.chunks.push({
-                        path: item.file.path,
-                        mtime: Math.floor(item.file.stat.mtime),
-                        content: item.chunk.content,
-                        model: this.model,
-                        dimension: dimension,
-                        vector: new Float32Array(emb),
-                        metadata: {
-                            startLine: item.chunk.startLine, 
-                            endLine: item.chunk.endLine, 
-                            heading: item.chunk.heading,
-                            chunkSize: this.maxChunkSize,
-                            prefix: this.prefix,
-                            fileHash: item.contentHash
-                        }
-                    });
-                    totalChunks++;
-                }
+                const stored = await this.storeChunkBatch(batch, dimension);
+                totalChunks += stored;
                 
                 // Periodically save to avoid losing all progress if user reloads app
                 if (j % 2000 === 0 && j > 0) {
@@ -534,6 +393,7 @@ export class Indexer {
             if (activeFile) {
                 this.plugin.updateFileStatus(activeFile);
             }
+            this.plugin.refreshSimilarViews();
         }
     }
 }

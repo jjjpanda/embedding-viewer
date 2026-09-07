@@ -7,8 +7,8 @@ const ALLOWED_ORIGINS = ['http://127.0.0.1', 'http://localhost'];
 
 export class LocalApi {
     private server: http.Server | null = null;
+    private isListening: boolean = false;
     private plugin: EmbeddingViewerPlugin;
-    private statusBarItem: HTMLElement | null = null;
 
     constructor(plugin: EmbeddingViewerPlugin) {
         this.plugin = plugin;
@@ -136,7 +136,7 @@ export class LocalApi {
                     }
 
                     const vector = vectors[0] as number[];
-                    const results = await this.plugin.queryService.findSimilarForVector(vector, undefined, limit);
+                    const results = await this.plugin.queryService.findSimilarForVector(vector, undefined, limit, undefined, false);
 
                     res.writeHead(200);
                     res.end(JSON.stringify({ results }));
@@ -155,34 +155,41 @@ export class LocalApi {
         const port = this.plugin.settings.apiPort || 27123;
 
         this.server.listen(port, '127.0.0.1', () => {
+            this.isListening = true;
             console.log(`Embedding Viewer API listening on http://127.0.0.1:${port}`);
-            if (!this.statusBarItem) {
-                this.statusBarItem = this.plugin.addStatusBarItem();
-            }
-            this.statusBarItem.setText(`Vault Embed API ON`);
+            this.plugin.updateFileStatus();
         });
 
         this.server.on('error', (err: any) => {
+            this.isListening = false;
+            if (this.server) {
+                try {
+                    this.server.close();
+                } catch {
+                    // ignore
+                }
+                this.server = null;
+            }
             if (err.code === 'EADDRINUSE') {
                 new Notice(`Embedding Viewer: Port ${port} is already in use. API disabled.`);
-                if (this.statusBarItem) {
-                    this.statusBarItem.setText(`Vault Embed API OFF`);
-                }
             } else {
                 console.error('API Server error:', err);
             }
+            this.plugin.updateFileStatus();
         });
     }
 
+    public isRunning(): boolean {
+        return this.isListening && this.server !== null;
+    }
+
     stop() {
+        this.isListening = false;
         if (this.server) {
             this.server.close();
             this.server = null;
-            if (this.statusBarItem) {
-                this.statusBarItem.remove();
-                this.statusBarItem = null;
-            }
             console.log('Embedding Viewer API stopped.');
+            this.plugin.updateFileStatus();
         }
     }
 }

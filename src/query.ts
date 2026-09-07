@@ -22,6 +22,17 @@ export interface ChunkMatchGroup {
 export class QueryService {
     constructor(private dbManager: DatabaseManager, private plugin: EmbeddingViewerPlugin) {}
 
+    public getLinkedPaths(targetPath?: string): Set<string> {
+        if (!targetPath) return new Set();
+        const resolvedLinks = this.plugin.app.metadataCache.resolvedLinks || {};
+        const outlinks = (resolvedLinks as any)[targetPath] || {};
+        const linkedPaths = new Set<string>(Object.keys(outlinks));
+        for (const [src, tgts] of Object.entries(resolvedLinks)) {
+            if ((tgts as any)[targetPath]) linkedPaths.add(src);
+        }
+        return linkedPaths;
+    }
+
     async findSimilarPerChunk(filePath: string, topKPerChunk: number = 3, maxChunks: number = 8): Promise<ChunkMatchGroup[]> {
         await this.dbManager.waitForLoad();
         try {
@@ -33,11 +44,12 @@ export class QueryService {
                 selectedRows = [...sourceRows].sort((a, b) => b.content.length - a.content.length).slice(0, maxChunks);
             }
 
+            const linkedPaths = this.getLinkedPaths(filePath);
             const FETCH_K = 10;
             const resultsArrays = [];
             for (const r of selectedRows) {
                 if (!r.vector) continue;
-                const matches = await this.findSimilarForVector(r.vector, filePath, FETCH_K);
+                const matches = await this.findSimilarForVector(r.vector, filePath, FETCH_K, linkedPaths);
                 resultsArrays.push(matches.map(m => ({ sourceContent: r.content, sourceHeading: r.metadata.heading || null, match: m })));
             }
             const allCandidates = resultsArrays.flat();
@@ -82,69 +94,66 @@ export class QueryService {
         }
     }
 
-    async findSimilarForVector(vector: number[] | Float32Array, excludePath?: string, topK: number = 5): Promise<QueryResult[]> {
+    async findSimilarForVector(
+        vector: number[] | Float32Array,
+        excludePath?: string,
+        topK: number = 5,
+        precomputedLinkedPaths?: Set<string>,
+        filterMaxSim: boolean = true
+    ): Promise<QueryResult[]> {
         await this.dbManager.waitForLoad();
         try {
             const nowMs = Date.now();
             const msPerMonth = 1000 * 60 * 60 * 24 * 30;
             const maxSim = this.plugin.settings.maximumSimilarity ?? 0.95;
             const penaltyRate = (this.plugin.settings.linkPenalty ?? 30) / 100.0;
+            const minSim = this.plugin.settings.minimumSimilarity ?? 0.60;
+            const penaltyPerMonth = (this.plugin.settings.penaltyPerMonth ?? 0.25) / 100.0;
 
-            let linkedPaths = new Set<string>();
-            if (excludePath) {
-                const resolvedLinks = this.plugin.app.metadataCache.resolvedLinks || {};
-                const outlinks = (resolvedLinks as any)[excludePath] || {};
-                linkedPaths = new Set<string>(Object.keys(outlinks));
-                for (const [src, tgts] of Object.entries(resolvedLinks)) {
-                    if ((tgts as any)[excludePath]) linkedPaths.add(src);
-                }
-            }
+            const linkedPaths = precomputedLinkedPaths ?? this.getLinkedPaths(excludePath);
 
-            const queryVector = vector instanceof Float32Array ? vector : new Float32Array(vector);
+            const rawVec = vector instanceof Float32Array ? vector.slice() : new Float32Array(vector);
+            const queryVector = this.dbManager.normalizeVector(rawVec);
             
-            const scored: QueryResult[] = [];
+            // Track highest similarity chunk per unique path to avoid sorting duplicate files
+            const bestPerPath = new Map<string, QueryResult>();
+
             for (const chunk of this.dbManager.state.chunks) {
                 if (excludePath && chunk.path === excludePath) continue;
-                if (!chunk.vector) continue;
+                if (!chunk.vector || chunk.vector.length !== queryVector.length) continue;
 
-                // compute cosine similarity
-                const rawSimilarity = this.dbManager.cosineSimilarity(queryVector, chunk.vector);
+                // Fast dot product on unit-normalized vectors
+                const rawSimilarity = this.dbManager.fastDotProduct(queryVector, chunk.vector);
                 
-                if (rawSimilarity >= maxSim) continue;
+                if (filterMaxSim && rawSimilarity >= maxSim) continue;
 
-                const timePenalty = (((nowMs - chunk.mtime) / msPerMonth) * (this.plugin.settings.penaltyPerMonth / 100.0));
+                const elapsedMs = Math.max(0, nowMs - chunk.mtime);
+                const timePenalty = ((elapsedMs / msPerMonth) * penaltyPerMonth);
                 const linkPenalty = linkedPaths.has(chunk.path) ? penaltyRate : 0;
                 const similarity = rawSimilarity - timePenalty - linkPenalty;
                 
-                if (similarity >= this.plugin.settings.minimumSimilarity) {
-                    scored.push({
-                        path: chunk.path,
-                        content: chunk.content,
-                        heading: chunk.metadata.heading || null,
-                        startLine: chunk.metadata.startLine || 0,
-                        endLine: chunk.metadata.endLine || 0,
-                        similarity,
-                        rawSimilarity,
-                        timePenalty,
-                        linkPenalty
-                    });
+                if (similarity >= minSim) {
+                    const existing = bestPerPath.get(chunk.path);
+                    if (!existing || similarity > existing.similarity) {
+                        bestPerPath.set(chunk.path, {
+                            path: chunk.path,
+                            content: chunk.content,
+                            heading: chunk.metadata.heading || null,
+                            startLine: chunk.metadata.startLine || 0,
+                            endLine: chunk.metadata.endLine || 0,
+                            similarity,
+                            rawSimilarity,
+                            timePenalty,
+                            linkPenalty
+                        });
+                    }
                 }
             }
             
-            // Sort by similarity descending
-            scored.sort((a, b) => b.similarity - a.similarity);
+            const candidates = Array.from(bestPerPath.values());
+            candidates.sort((a, b) => b.similarity - a.similarity);
             
-            // Deduplicate by path
-            const seenPaths = new Set<string>();
-            const results: QueryResult[] = [];
-            for (const item of scored) {
-                if (seenPaths.has(item.path)) continue;
-                seenPaths.add(item.path);
-                results.push(item);
-                if (results.length >= topK) break;
-            }
-            
-            return results;
+            return candidates.slice(0, topK);
         } catch (err) {
             console.error('Query failed:', err);
             return [];

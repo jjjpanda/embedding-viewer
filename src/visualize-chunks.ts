@@ -92,6 +92,7 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
         ),
         ViewPlugin.fromClass(class {
             timer: number | null = null;
+            leaveTimer: number | null = null;
             lastHoveredChunkIndex: number | null = null;
             currentTooltip: HTMLElement | null = null;
             cleanupDismiss: (() => void) | null = null;
@@ -114,7 +115,9 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
 
             clear() {
                 if (this.timer) window.clearTimeout(this.timer);
+                if (this.leaveTimer) window.clearTimeout(this.leaveTimer);
                 this.timer = null;
+                this.leaveTimer = null;
                 this.lastHoveredChunkIndex = null;
                 if (this.currentTooltip) {
                     this.currentTooltip.remove();
@@ -127,6 +130,11 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
             }
 
             handleMove(e: MouseEvent, view: EditorView) {
+                if (this.leaveTimer) {
+                    window.clearTimeout(this.leaveTimer);
+                    this.leaveTimer = null;
+                }
+
                 // If selection exists, do not show chunk tooltip
                 if (!view.state.selection.main.empty) {
                     this.clear();
@@ -194,7 +202,8 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
             async triggerHover(_chunk: Chunk, text: string, file: TFile, x: number, y: number) {
                 try {
                     const cleanSelection = indexer.stripWikilinks(text);
-                    const vectors = await indexer.embed([cleanSelection]);
+                    const queryText = `${plugin.settings.embeddingQueryPrefix || ''}${cleanSelection}`;
+                    const vectors = await indexer.embed([queryText]);
                     if (vectors.length === 0) return;
 
                     const vector = vectors[0] as number[];
@@ -204,8 +213,27 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                     const dom = buildSimilarTooltip(app, results, 'Similar Snippets (Chunk)');
                     dom.classList.add('read-mode-tooltip', 'embedding-popup-container');
                     dom.style.position = 'absolute';
-                    dom.style.left = `${x}px`;
-                    dom.style.top = `${y + 20}px`;
+
+                    const tooltipWidth = 360;
+                    const tooltipHeight = 220;
+                    let left = x + window.scrollX;
+                    if (x + tooltipWidth > window.innerWidth - 20) {
+                        left = Math.max(10, window.innerWidth - tooltipWidth - 20) + window.scrollX;
+                    }
+                    let top = y + window.scrollY + 8;
+                    if (y + tooltipHeight > window.innerHeight && y > tooltipHeight) {
+                        top = y + window.scrollY - tooltipHeight - 8;
+                    }
+
+                    dom.style.left = `${left}px`;
+                    dom.style.top = `${top}px`;
+
+                    dom.addEventListener('mouseenter', () => {
+                        if (this.leaveTimer) {
+                            window.clearTimeout(this.leaveTimer);
+                            this.leaveTimer = null;
+                        }
+                    });
 
                     document.body.appendChild(dom);
                     this.currentTooltip = dom;
@@ -224,7 +252,15 @@ export function createChunkVisualizer(app: App, indexer: Indexer, plugin: Embedd
                     if ((this as any).currentTooltip && (this as any).currentTooltip.contains(target)) {
                         return;
                     }
-                    (this as any).clear();
+                    if ((this as any).leaveTimer) {
+                        window.clearTimeout((this as any).leaveTimer);
+                    }
+                    (this as any).leaveTimer = window.setTimeout(() => {
+                        if ((this as any).currentTooltip && (this as any).currentTooltip.matches(':hover')) {
+                            return;
+                        }
+                        (this as any).clear();
+                    }, 150);
                 }
             }
         })
