@@ -26,6 +26,7 @@ export interface FileRegistryRecord {
     hash: string;
     chunk_size: number;
     prefix: string;
+    excluded_hash?: string;
 }
 
 export interface DatabaseState {
@@ -48,6 +49,7 @@ export class DatabaseManager {
     private isSaving: boolean = false;
     private pendingSavePromise: Promise<void> | null = null;
     private needsAnotherSave: boolean = false;
+    private saveDebounceTimer: number | null = null;
 
     private dbPath: string;
     private jsonlPath: string;
@@ -62,6 +64,20 @@ export class DatabaseManager {
         this.loadPromise = new Promise((resolve) => {
             this.loadPromiseResolver = resolve;
         });
+    }
+
+    normalizeVector(vec: Float32Array): Float32Array {
+        let norm = 0;
+        for (let i = 0; i < vec.length; i++) {
+            const val = vec[i]!;
+            norm += val * val;
+        }
+        if (norm === 0) return vec;
+        const invNorm = 1 / Math.sqrt(norm);
+        for (let i = 0; i < vec.length; i++) {
+            vec[i] = vec[i]! * invNorm;
+        }
+        return vec;
     }
 
     async waitForLoad() {
@@ -163,8 +179,9 @@ export class DatabaseManager {
                 let offset = 0;
                 let lastYield = performance.now();
                 for (const c of this.state.chunks) {
-                    // Create a view into the array buffer for this chunk's vector
-                    c.vector = bin.subarray(offset, offset + c.dimension);
+                    // Create a view into the array buffer for this chunk's vector and normalize
+                    const slice = bin.subarray(offset, offset + c.dimension);
+                    c.vector = this.normalizeVector(slice);
                     offset += c.dimension;
                     if (performance.now() - lastYield > 16) {
                         await new Promise(r => window.setTimeout(r, 0));
@@ -340,7 +357,29 @@ export class DatabaseManager {
         }
     }
 
+    public requestDebouncedSave(delayMs: number = 10000): void {
+        if (this.saveDebounceTimer !== null) {
+            window.clearTimeout(this.saveDebounceTimer);
+        }
+        this.saveDebounceTimer = window.setTimeout(async () => {
+            this.saveDebounceTimer = null;
+            await this.saveDb();
+        }, delayMs);
+    }
+
+    public async flushPendingSave(): Promise<void> {
+        if (this.saveDebounceTimer !== null) {
+            window.clearTimeout(this.saveDebounceTimer);
+            this.saveDebounceTimer = null;
+            await this.saveDb();
+        }
+    }
+
     async resetData() {
+        if (this.saveDebounceTimer !== null) {
+            window.clearTimeout(this.saveDebounceTimer);
+            this.saveDebounceTimer = null;
+        }
         this.state = {
             chunks: [],
             registry: {}
@@ -348,6 +387,16 @@ export class DatabaseManager {
         await this.saveDb();
     }
     
+    fastDotProduct(vecA: Float32Array, vecB: Float32Array): number {
+        if (vecA.length !== vecB.length) return 0;
+        let dotProduct = 0;
+        const len = vecA.length;
+        for (let i = 0; i < len; i++) {
+            dotProduct += vecA[i]! * vecB[i]!;
+        }
+        return dotProduct;
+    }
+
     cosineSimilarity(vecA: Float32Array, vecB: Float32Array): number {
         let dotProduct = 0;
         let normA = 0;
@@ -364,6 +413,6 @@ export class DatabaseManager {
     }
     
     async close() {
-        // No-op for file DB
+        await this.flushPendingSave();
     }
 }

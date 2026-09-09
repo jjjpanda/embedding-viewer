@@ -48,12 +48,17 @@ export function buildSimilarTooltip(
 
         pathSpan.onclick = async (e) => {
             e.preventDefault();
-            const file = app.metadataCache.getFirstLinkpathDest(res.path, '');
-            if (file) {
-                const leaf = app.workspace.getLeaf(true);
+            const file = app.vault.getAbstractFileByPath(res.path);
+            const isMod = e.ctrlKey || e.metaKey;
+            if (file instanceof TFile) {
+                let leaf = app.workspace.getLeaf(isMod ? 'tab' : false);
+                if (leaf.getRoot() !== app.workspace.rootSplit) {
+                    const rootLeaf = app.workspace.getMostRecentLeaf(app.workspace.rootSplit);
+                    leaf = isMod ? app.workspace.getLeaf('tab') : (rootLeaf || app.workspace.getLeaf('tab'));
+                }
                 await leaf.openFile(file, { eState: { line: res.startLine } });
             } else {
-                app.workspace.openLinkText(res.path, '', true);
+                await app.workspace.openLinkText(res.path, '', isMod);
             }
         };
 
@@ -257,8 +262,20 @@ export function setupReadModeHover(app: App, plugin: EmbeddingViewerPlugin) {
                 const dom = buildSimilarTooltip(app, results, 'Similar Snippets');
                 dom.classList.add('read-mode-tooltip', 'embedding-popup-container');
                 dom.style.position = 'absolute';
-                dom.style.left = `${rect.left}px`;
-                dom.style.top = `${rect.bottom + window.scrollY + 10}px`;
+
+                const tooltipWidth = 360;
+                const tooltipHeight = 220;
+                let left = rect.left + window.scrollX;
+                if (rect.left + tooltipWidth > window.innerWidth - 20) {
+                    left = Math.max(10, window.innerWidth - tooltipWidth - 20) + window.scrollX;
+                }
+                let top = rect.bottom + window.scrollY + 8;
+                if (rect.bottom + tooltipHeight > window.innerHeight && rect.top > tooltipHeight) {
+                    top = rect.top + window.scrollY - tooltipHeight - 8;
+                }
+
+                dom.style.left = `${left}px`;
+                dom.style.top = `${top}px`;
 
                 document.body.appendChild(dom);
                 currentTooltip = dom;

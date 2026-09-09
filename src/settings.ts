@@ -196,6 +196,20 @@ export class EmbeddingViewerSettingTab extends PluginSettingTab {
                     }
                 }));
 
+        new Setting(containerEl)
+            .setName('Excluded Phrases / Boilerplate')
+            .setDesc('Lines or headings to strip from chunk text and hierarchy (e.g. daily note headers like "## Habits" or "## Tasks"). One phrase per line. Run "Rebuild vault index" to re-process notes with the updated exclusions.')
+            .addTextArea(text => text
+                .setPlaceholder('## Habits\n## Daily Log\n## Tasks')
+                .setValue((this.plugin.settings.lastExcludedPhrases || []).join('\n'))
+                .onChange(async (value) => {
+                    this.plugin.settings.lastExcludedPhrases = value
+                        .split('\n')
+                        .map(p => p.trim())
+                        .filter(p => p.length > 0);
+                    await this.plugin.saveSettings();
+                }));
+
         // 3. Similarity & Penalties
         new Setting(containerEl).setName('Similarity & Ranking Penalties').setHeading();
 
